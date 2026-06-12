@@ -9,7 +9,7 @@ defmodule MobPhotos do
   process; `READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO` (API 33+) or
   `READ_EXTERNAL_STORAGE` (API <= 32) are declared in this plugin's
   manifest and merged into the host AndroidManifest at build time. See the
-  [permissions guide](permissions.html) for the cross-platform table.
+  [permissions guide](https://hexdocs.pm/mob/permissions.html) for the cross-platform table.
 
   Results arrive as:
 
