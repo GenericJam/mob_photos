@@ -28,8 +28,8 @@ defmodule MobPhotos.MixProject do
     # Hex constraint ("~> 0.6") when mob publishes. :mob_dev is test-only (the
     # manifest tests run the real pre-publish validator) and never ships.
     [
-      {:mob, path: "../mob"},
-      {:mob_dev, path: "../mob_dev", only: [:dev, :test], runtime: false},
+      {:mob, "~> 0.7"},
+      {:mob_dev, "~> 0.6", only: [:dev, :test], runtime: false},
       # Code quality — Credo + ex_slop (AI-pattern checks) + jump_credo_checks,
       # mirroring mob core's pre-commit gate.
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
