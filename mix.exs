@@ -45,7 +45,7 @@ defmodule MobPhotos.MixProject do
       links: %{"GitHub" => @source_url},
       # The native sources + manifest must ship in the package — the host's
       # native build compiles them from deps/<plugin>/priv.
-      files: ~w(lib src priv mix.exs README* CHANGELOG* EXTRACTION*)
+      files: ~w(lib src priv mix.exs README* CHANGELOG*)
     ]
   end
 end
