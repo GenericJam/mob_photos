@@ -32,6 +32,10 @@ jobs:
       # `env.HEX_API_KEY != ''` so a missing secret skips cleanly instead
       # of failing with an auth error.
       HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+      # Shared mob first-party signing key. The Sign step below regenerates
+      # priv/mob_plugin.sig from the CURRENT manifest before publish, so the
+      # published artifact's signature can never drift stale.
+      MOB_PLUGIN_SIGN_KEY: ${{ secrets.MOB_PLUGIN_SIGN_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -138,6 +142,17 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
             echo "package=$pkg" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Sign plugin (regenerate signature from current manifest)
+        if: env.HEX_API_KEY != '' && steps.hex_check.outputs.exists == 'false' && env.MOB_PLUGIN_SIGN_KEY != ''
+        run: |
+          pkg="${{ steps.hex_check.outputs.package }}"
+          mkdir -p ~/.mob/keys
+          printf '%s' "$MOB_PLUGIN_SIGN_KEY" > ~/.mob/keys/"$pkg".priv
+          chmod 600 ~/.mob/keys/"$pkg".priv
+          mix deps.get
+          mix mob.plugin.sign
+          rm -f ~/.mob/keys/"$pkg".priv
 
       - name: mix hex.publish
         if: env.HEX_API_KEY != '' && steps.hex_check.outputs.exists == 'false'
