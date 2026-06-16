@@ -45,6 +45,18 @@ def handle_info({:photos, :cancelled}, socket), do: ...
 - The `types:` option is currently ignored by both native sides; both pickers
   show images + videos.
 
+## Development
+
+Clone, then run once:
+
+```bash
+mix setup
+```
+
+That fetches deps and activates the repo's git hooks (`.githooks/pre-push`):
+`mix format --check`, `mix credo --strict` (incl. ExSlop), and `mix compile --warnings-as-errors` run on every push, plus the full test
+suite when `mix.exs` changes — the same gate CI enforces before publishing.
+
 ## License
 
 MIT
