@@ -33,16 +33,18 @@ extern var g_jvm: ?*jni.JavaVM;
 // ── Plugin-owned bridge-class method-id cache ────────────────────────────
 const PhotosMethods = struct {
     photos_pick: jni.JMethodID = null,
+    media_list: jni.JMethodID = null,
 };
 
 var g_photos: PhotosMethods = .{};
 var g_photos_cls: jni.JClass = null;
 
-// ── nativeRegister thunk — cache the bridge jclass + method id ────────────
+// ── nativeRegister thunk — cache the bridge jclass + method ids ───────────
 export fn Java_io_mob_photos_MobPhotosBridge_nativeRegister(jenv: *jni.JNIEnv, cls: jni.JClass) callconv(.c) void {
     g_photos_cls = jni.newGlobalRef(jenv, cls);
     if (g_photos_cls == null) return;
     g_photos.photos_pick = jni.getStaticMethodID(jenv, cls, "photos_pick", "(JLjava/lang/String;)V");
+    g_photos.media_list = jni.getStaticMethodID(jenv, cls, "media_list", "(JLjava/lang/String;)V");
 }
 
 // ── Thread-attach + pid round-trip helpers (mirror mob-core / camera) ─────
@@ -139,6 +141,50 @@ export fn Java_io_mob_photos_MobPhotosBridge_nativeDeliverPhotosPicked(
     _ = erts.enif_send(null, &pid, env, msg);
 }
 
+// {:mob_file_result, "media", "listed", json_binary} — same delivery shape as
+// the picker (nativeDeliverPhotosPicked above), event "media" / sub "listed".
+// Core's Mob.Screen decoder (lib/mob/screen.ex) is generic for event/sub pairs
+// it doesn't special-case: it decodes the JSON list and its `_` fallback
+// re-dispatches {:media, :listed, items}, atomizing each item's map keys
+// (uri / display_name / size / date_added / mime_type / type). No core change
+// needed — the same decoder already serving :photos / :files handles this.
+export fn Java_io_mob_photos_MobPhotosBridge_nativeDeliverMediaListed(
+    jenv: *jni.JNIEnv,
+    cls: jni.JClass,
+    pid_long: jni.JLong,
+    json: jni.JString,
+) callconv(.c) void {
+    _ = cls;
+    var pid = pidFromLong(pid_long);
+    const env = erts.enif_alloc_env() orelse return;
+    defer erts.enif_free_env(env);
+
+    const json_c = jenv.*.GetStringUTFChars.?(jenv, json, null) orelse return;
+    defer jenv.*.ReleaseStringUTFChars.?(jenv, json, json_c);
+
+    const event = "media";
+    const sub = "listed";
+    const jl = std.mem.len(json_c);
+
+    var eb: erts.ErlNifBinary = undefined;
+    var sb: erts.ErlNifBinary = undefined;
+    var jb: erts.ErlNifBinary = undefined;
+    if (erts.enif_alloc_binary(event.len, &eb) == 0) return;
+    if (erts.enif_alloc_binary(sub.len, &sb) == 0) return;
+    if (erts.enif_alloc_binary(jl, &jb) == 0) return;
+    @memcpy(eb.data[0..event.len], event);
+    @memcpy(sb.data[0..sub.len], sub);
+    @memcpy(jb.data[0..jl], json_c[0..jl]);
+
+    const msg = erts.makeTuple(env, .{
+        erts.atom(env, "mob_file_result"),
+        erts.enif_make_binary(env, &eb),
+        erts.enif_make_binary(env, &sb),
+        erts.enif_make_binary(env, &jb),
+    });
+    _ = erts.enif_send(null, &pid, env, msg);
+}
+
 // ── NIFs ──────────────────────────────────────────────────────────────────
 
 // PARITY: core's nif_photos_pick (mob_nif.zig:2553-2566) reads only argv[0]
@@ -157,6 +203,31 @@ fn nif_photos_pick(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_N
     return callBridgePidStr(env, g_photos.photos_pick, pid, jni.asCStr(&max_buf));
 }
 
+// Copy a binary/iolist arg into a null-terminated buffer. The bridge call
+// (newStringUTF in callBridgePidStr) copies the jstring synchronously, so a
+// stack buffer is fine. (Mirrors mob_camera's binArgZ.)
+fn binArgZ(env: ?*erts.ErlNifEnv, term: erts.ERL_NIF_TERM, buf: []u8) bool {
+    var bin: erts.ErlNifBinary = undefined;
+    if (erts.enif_inspect_binary(env, term, &bin) == 0 and
+        erts.enif_inspect_iolist_as_binary(env, term, &bin) == 0) return false;
+    const n = @min(bin.size, buf.len - 1);
+    @memcpy(buf[0..n], bin.data[0..n]);
+    buf[n] = 0;
+    return true;
+}
+
+// media_list(opts_json) — async: the bridge queries MediaStore on a background
+// thread and delivers {:media, :listed, items} via nativeDeliverMediaListed.
+// Arity 1 (opts JSON binary) matches the .erl stub.
+fn nif_media_list(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
+    _ = argc;
+    var jbuf: [256]u8 = undefined;
+    if (!binArgZ(env, argv[0], &jbuf)) return erts.badarg(env);
+    var pid: erts.ErlNifPid = undefined;
+    _ = erts.enif_self(env, &pid);
+    return callBridgePidStr(env, g_photos.media_list, pid, @ptrCast(&jbuf));
+}
+
 // ── NIF table + init entry point ─────────────────────────────────────────
 fn nifLoad(env: ?*erts.ErlNifEnv, priv: *?*anyopaque, info: erts.ERL_NIF_TERM) callconv(.c) c_int {
     _ = env;
@@ -167,6 +238,7 @@ fn nifLoad(env: ?*erts.ErlNifEnv, priv: *?*anyopaque, info: erts.ERL_NIF_TERM) c
 
 const nif_funcs = [_]erts.ErlNifFunc{
     .{ .name = "photos_pick", .arity = 2, .fptr = nif_photos_pick, .flags = 0 },
+    .{ .name = "media_list", .arity = 1, .fptr = nif_media_list, .flags = 0 },
 };
 
 var nif_entry: erts.ErlNifEntry = .{

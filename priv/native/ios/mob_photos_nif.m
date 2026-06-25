@@ -1,10 +1,20 @@
-/* mob_photos_nif — iOS photo/video picker tier-1 plugin NIF (Objective-C).
+/* mob_photos_nif — iOS photo/video picker + library enumeration tier-1 plugin
+ * NIF (Objective-C).
  *
  * Extracted from mob-core ios/mob_nif.m (the "Photo library picker" section,
  * mob_nif.m:2423-2515): PHPickerViewController (iOS 14+, runs out of process —
- * no permission needed). Self-contained — core's mob_send2 / mob_root_vc are
- * private statics, so this ships its own (pho_send2 / pho_root_vc). Compiled
- * as ObjC (-fobjc-arc) via the plugin objc-NIF path (manifest lang: :objc).
+ * the picker needs no permission). Self-contained — core's mob_send2 /
+ * mob_root_vc are private statics, so this ships its own (pho_send2 /
+ * pho_root_vc). Compiled as ObjC (-fobjc-arc) via the plugin objc-NIF path
+ * (manifest lang: :objc).
+ *
+ * This plugin also owns the :media runtime-permission capability (mirrors how
+ * mob_camera owns :camera): the handler self-registers with core's permission
+ * registry at NIF load (mob_register_permission_handler, an exported core
+ * symbol linked into the same static binary) and requests PHPhotoLibrary
+ * read-write authorization. Library ENUMERATION (media_list) is not yet
+ * implemented on iOS — it returns {error, unsupported}; Android is the
+ * priority. (A PHAsset-backed implementation can replace the stub later.)
  *
  * Delivered message shapes (exact core parity, mob_nif.m:2437 + 2490-2492):
  *   cancelled -> {photos, cancelled}
@@ -14,9 +24,13 @@
  * carries them (as 0) — preserved as-is.
  */
 #import <Foundation/Foundation.h>
+#import <Photos/Photos.h>
 #import <PhotosUI/PhotosUI.h>
 #import <UIKit/UIKit.h>
 #include <erl_nif.h>
+
+/* Defined in core mob's ios/mob_nif.m, linked into the same static binary. */
+extern void mob_register_permission_handler(const char *cap, void (*fn)(ErlNifPid));
 
 // Self-contained {atom, atom} send (core's mob_send2 is a private static).
 static void pho_send2(const ErlNifPid *pid, const char *a1, const char *a2) {
@@ -38,6 +52,25 @@ static UIViewController *pho_root_vc(void) {
     }
   }
   return nil;
+}
+
+// ── :media permission (registered with core's registry at NIF load) ───────
+static void pho_send_permission(ErlNifPid pid, const char *status) {
+  ErlNifEnv *e = enif_alloc_env();
+  ERL_NIF_TERM msg = enif_make_tuple3(e, enif_make_atom(e, "permission"),
+                                      enif_make_atom(e, "media"), enif_make_atom(e, status));
+  enif_send(NULL, &pid, e, msg);
+  enif_free_env(e);
+}
+
+static void mob_photos_request_permission(ErlNifPid pid) {
+  [PHPhotoLibrary
+      requestAuthorizationForAccessLevel:PHAccessLevelReadWrite
+                                 handler:^(PHAuthorizationStatus status) {
+                                   BOOL ok = (status == PHAuthorizationStatusAuthorized ||
+                                              status == PHAuthorizationStatusLimited);
+                                   pho_send_permission(pid, ok ? "granted" : "denied");
+                                 }];
 }
 
 // ── Photo library picker ──────────────────────────────────────────────────
@@ -137,12 +170,32 @@ static ERL_NIF_TERM nif_photos_pick(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     return enif_make_atom(env, "ok");
 }
 
+// ── Library enumeration ─────────────────────────────────────────────────────
+// Not implemented on iOS yet — returns {error, unsupported} synchronously, so
+// MobPhotos.list_media/2 is a no-op on iOS (no {:media, :listed, _} message is
+// delivered). Android is the priority; a PHAsset-backed implementation can
+// replace this stub later. Arity 1 (opts JSON) matches the .erl stub.
+static ERL_NIF_TERM nif_media_list(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
+    return enif_make_tuple2(env, enif_make_atom(env, "error"),
+                            enif_make_atom(env, "unsupported"));
+}
+
 // ── Registration ──────────────────────────────────────────────────────────
-// No load callback needed (unlike mob_camera, which registers a permission
-// handler at load) — the picker requires no runtime permission.
+// load callback registers the :media permission handler with core's registry
+// (the picker itself needs no permission, but enumeration does).
+static int pho_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
+    (void)env;
+    (void)priv_data;
+    (void)load_info;
+    mob_register_permission_handler("media", mob_photos_request_permission);
+    return 0;
+}
 
 static ErlNifFunc nif_funcs[] = {
     {"photos_pick", 2, nif_photos_pick, 0},
+    {"media_list", 1, nif_media_list, 0},
 };
 
-ERL_NIF_INIT(mob_photos_nif, nif_funcs, NULL, NULL, NULL, NULL)
+ERL_NIF_INIT(mob_photos_nif, nif_funcs, pho_load, NULL, NULL, NULL)

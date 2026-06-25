@@ -30,15 +30,18 @@ package io.mob.photos
 
 import android.app.Activity
 import android.net.Uri
+import android.provider.MediaStore
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.ActivityResultRegistryOwner
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicLong
 
-object MobPhotosBridge : io.mob.plugin.MobActivityAware {
+object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionProvider {
     private var activityRef: WeakReference<Activity>? = null
 
     @JvmStatic external fun nativeRegister()
@@ -53,11 +56,36 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware {
         json: String,
     )
 
+    // {:media, :listed, items} — json is a JSON array of metadata maps
+    // (string keys), decoded by the zig NIF into a list of Elixir maps.
+    @JvmStatic external fun nativeDeliverMediaListed(
+        pid: Long,
+        json: String,
+    )
+
     @JvmStatic fun register() = nativeRegister()
 
     override fun setActivity(activity: Activity) {
         activityRef = WeakReference(activity)
     }
+
+    // The :media capability maps to READ_MEDIA_IMAGES + READ_MEDIA_VIDEO on
+    // API 33+ (READ_EXTERNAL_STORAGE on older). core's MobBridge.request_permission
+    // falls through to MobPluginBootstrap.permissionsFor(cap) for caps it doesn't
+    // know, which walks the registered providers — this is how :media is granted.
+    override fun permissionsFor(cap: String): Array<String>? =
+        if (cap == "media") {
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                arrayOf(
+                    android.Manifest.permission.READ_MEDIA_IMAGES,
+                    android.Manifest.permission.READ_MEDIA_VIDEO,
+                )
+            } else {
+                arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+        } else {
+            null
+        }
 
     private val pickSeq = AtomicLong(0L)
 
@@ -144,5 +172,93 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware {
                 nativeDeliverPhotosCancelled(pid)
             }
         }.start()
+    }
+
+    // ── Library enumeration (MediaStore) ───────────────────────────────────
+    // Signature matches what the zig NIF calls: (JLjava/lang/String;)V — the
+    // opts JSON carries {"type":"image"|"video"|"all","limit":N}. Queries the
+    // MediaStore via ContentResolver on a background thread (the NIF callback
+    // arrives on a BEAM scheduler thread), builds a JSON array of metadata, and
+    // delivers it as {:media, :listed, items}. Requires READ_MEDIA_* — without
+    // it the cursor is empty and an empty list is delivered (not an error). This
+    // lists metadata only; it does NOT copy bytes (unlike the picker).
+    @JvmStatic
+    fun media_list(
+        pid: Long,
+        optsJson: String,
+    ) {
+        val type =
+            try {
+                JSONObject(optsJson).optString("type", "all")
+            } catch (_: Exception) {
+                "all"
+            }
+        val limit =
+            try {
+                JSONObject(optsJson).optInt("limit", 200)
+            } catch (_: Exception) {
+                200
+            }
+        val activity =
+            activityRef?.get() ?: run {
+                nativeDeliverMediaListed(pid, "[]")
+                return
+            }
+        Thread {
+            val out = JSONArray()
+            try {
+                if (type == "image" || type == "all") {
+                    queryInto(activity, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image", limit, out)
+                }
+                if (type == "video" || type == "all") {
+                    queryInto(activity, MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video", limit, out)
+                }
+            } catch (e: Exception) {
+                // A SecurityException (permission not granted) or any query
+                // failure yields whatever was gathered so far (often empty).
+            }
+            nativeDeliverMediaListed(pid, out.toString())
+        }.start()
+    }
+
+    // DISPLAY_NAME / SIZE / DATE_ADDED / MIME_TYPE are shared column names
+    // across MediaStore.Images and MediaStore.Video (MediaColumns), so one
+    // projection serves both. date_added is already unix seconds.
+    private fun queryInto(
+        activity: Activity,
+        collection: Uri,
+        kind: String,
+        limit: Int,
+        out: JSONArray,
+    ) {
+        val projection =
+            arrayOf(
+                MediaStore.MediaColumns._ID,
+                MediaStore.MediaColumns.DISPLAY_NAME,
+                MediaStore.MediaColumns.SIZE,
+                MediaStore.MediaColumns.DATE_ADDED,
+                MediaStore.MediaColumns.MIME_TYPE,
+            )
+        val order = "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+        activity.contentResolver.query(collection, projection, null, null, order)?.use { c ->
+            val idCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+            val nameCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+            val sizeCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
+            val dateCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_ADDED)
+            val mimeCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
+            while (c.moveToNext()) {
+                if (limit > 0 && out.length() >= limit) break
+                val id = c.getLong(idCol)
+                val uri = Uri.withAppendedPath(collection, id.toString())
+                val o = JSONObject()
+                o.put("uri", uri.toString())
+                o.put("display_name", c.getString(nameCol) ?: "")
+                o.put("size", c.getLong(sizeCol))
+                o.put("date_added", c.getLong(dateCol))
+                o.put("mime_type", c.getString(mimeCol) ?: "")
+                o.put("type", kind)
+                out.put(o)
+            }
+        }
     }
 }
