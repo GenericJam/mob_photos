@@ -1,8 +1,8 @@
-# AGENTS.md — orientation for AI agents working on mob_photos
+# mob_photos — Agent Instructions
 
 You're in **mob_photos**, a Mob plugin for the OS photo/video library. Two access modes: the system picker (`pick/2`) runs out of process and needs no runtime permission on either platform; library enumeration (`list_media/2`) reads MediaStore/PHPhotoLibrary directly and does need the `:media` permission.
 
-**Also read [`~/code/mob/AGENTS.md`](../mob/AGENTS.md)** for the system view — mob's three-repo topology, plugin manifest schema, `Mob.Composite` / `Mob.Sigil`, how to drive a running app from your session, and the cross-cutting pre-empt-failure rules. This file is mob_photos-specific.
+**Also read [`~/code/mob/AGENTS.md`](../mob/AGENTS.md)** for the system view — mob's three-repo topology, plugin manifest schema, `Mob.Composite` / `Mob.Sigil`, how to drive a running app from your session, and the cross-cutting pre-empt-failure rules. See [`~/code/mob/MOB_PLUGINS.md`](../mob/MOB_PLUGINS.md) for the manifest schema. This file is mob_photos-specific.
 
 > **Keep this file current.** When you change the picker/enumeration API, add a delivery message shape, or hit a gotcha that would trip the next agent, fix it here in the same commit — not in a follow-up.
 
@@ -65,9 +65,9 @@ The suite pins the manifest via `MobDev.Plugin.{Manifest, Validator}`, the NIF s
 6. **The `types:` option is currently ignored by both native sides.** `pick(socket, types: [:image])` will still show videos. Core shipped it that way and the plugin preserves the behaviour; if you wire it up, do both platforms in the same commit and update the moduledoc.
 7. **The published package is signed** (shared mob first-party Ed25519 key, regenerated in CI on every release). Do not commit `priv/mob_plugin.pub` changes casually — the CI job cross-checks that `MOB_PLUGIN_SIGN_KEY` matches the committed public key before publish.
 
-## Pre-commit + release
+## Pre-commit checklist
 
-Pre-commit checklist (same gate as mob core):
+Same gate as mob core:
 
 ```bash
 mix test
@@ -75,6 +75,10 @@ mix format
 mix credo --strict       # includes ExSlop + jump_credo_checks
 ```
 
-Pre-push hook (`.githooks/pre-push`, activate via `git config core.hooksPath .githooks`) runs format / credo / compile on every push, and the full test suite when `mix.exs` changes (release preflight).
+Native changes (`.m` / `.zig` / `.kt`) aren't exercised by `mix test` — they need a `mix mob.deploy --native` of a host app (e.g. `mob_plugin_demo`) and a device check before committing (see Testing).
 
-Releases: bump `@version` in `mix.exs` on master and `.github/workflows/release.yml` handles tag / GitHub Release / Hex publish. See [`~/code/mob/RELEASE.md`](../mob/RELEASE.md) for the trigger model. Do NOT bump versions without explicit permission.
+Pre-push hook (`.githooks/pre-push`, activate via `git config core.hooksPath .githooks`) runs `mix format --check-formatted`, `mix credo --strict`, and `mix compile --warnings-as-errors` on every push, plus the full test suite when `mix.exs` changes (release preflight).
+
+## Release flow
+
+Bump `@version` in `mix.exs` on master and `.github/workflows/release.yml` handles tag / GitHub Release / Hex publish, each step idempotent. Signed release: CI regenerates an Ed25519 signature against the committed `priv/mob_plugin.pub` on every publish — generated apps trust the shared mob first-party key so the plugin clears the signature gate without `acknowledge_unsafe_plugins`. Do NOT bump versions without explicit permission. See [`~/code/mob/RELEASE.md`](../mob/RELEASE.md) for the full trigger model.
