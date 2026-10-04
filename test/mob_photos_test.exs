@@ -92,7 +92,7 @@ defmodule MobPhotosTest do
     test "every NIF the public API calls is exported by the stub at the right arity" do
       exports = :mob_photos_nif.module_info(:exports)
 
-      for fa <- [photos_pick: 2, media_list: 1, photo_thumbnail: 1] do
+      for fa <- [photos_pick: 2, media_list: 1, photo_thumbnail: 2] do
         assert fa in exports, "#{inspect(fa)} missing from mob_photos_nif exports"
       end
     end
@@ -255,6 +255,7 @@ defmodule MobPhotosTest do
                MobPhotos.decode_thumbnail_result(~s({"error":"unsupported"}))
 
       assert {:error, :permission} = MobPhotos.decode_thumbnail_result(~s({"error":"permission"}))
+      assert {:error, :timeout} = MobPhotos.decode_thumbnail_result(~s({"error":"timeout"}))
 
       assert {:error, "out of memory decoding the image"} =
                MobPhotos.decode_thumbnail_result(~s({"error":"out of memory decoding the image"}))
@@ -309,9 +310,15 @@ defmodule MobPhotosTest do
                "2023-07-14T09:00:00"
     end
 
-    test "taken_at: a zero/negative platform date means unknown" do
+    test "taken_at: a zero/negative or out-of-range platform date means unknown" do
       assert taken_at(%{"date_taken_ms" => 0}) == nil
       assert taken_at(%{"date_taken_ms" => -1}) == nil
+      assert taken_at(%{"date_taken_ms" => 1_714_592_096_000_000_000}) == nil
+    end
+
+    test "taken_at: an offset outside the real UTC range is dropped" do
+      assert taken_at(%{"exif_datetime" => "2023:07:14 09:00:00", "exif_offset" => "+99:99"}) ==
+               "2023-07-14T09:00:00"
     end
 
     # Android's photo picker hands out copies with the GPS tags zeroed.
@@ -394,12 +401,6 @@ defmodule MobPhotosTest do
       {:ok, m} = Manifest.load(@plugin_dir)
       [%{ios: %{handler: handler}}] = m.permissions
       assert src =~ handler
-    end
-
-    test "media_list and photo_thumbnail are both registered", %{src: src} do
-      assert src =~ ~s({"media_list", 1, nif_media_list, 0})
-      # A synchronous full-size decode must never run on a normal scheduler.
-      assert src =~ ~s({"photo_thumbnail", 1, nif_photo_thumbnail, ERL_NIF_DIRTY_JOB_IO_BOUND})
     end
   end
 

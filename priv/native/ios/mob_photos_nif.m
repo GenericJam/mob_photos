@@ -24,8 +24,9 @@
  *                — the same envelope the Android bridge sends; core's
  *                Mob.Screen decodes it into {media, listed, Items}.
  *
- * photo_thumbnail/1 is a synchronous dirty-IO NIF: JSON request in, JSON
- * reply out (decoded by MobPhotos.decode_thumbnail_result/1).
+ * photo_thumbnail/2 queues the work on a GCD queue and returns ok; the JSON
+ * reply goes to the given receiver as {mob_photos_thumbnail, Json} (decoded by
+ * MobPhotos.decode_thumbnail_result/1).
  */
 #import <Foundation/Foundation.h>
 #import <ImageIO/ImageIO.h>
@@ -48,11 +49,13 @@ static void pho_send2(const ErlNifPid *pid, const char *a1, const char *a2) {
 }
 
 static ERL_NIF_TERM pho_make_binary(ErlNifEnv *e, const void *data, size_t len) {
-  ErlNifBinary bin;
-  enif_alloc_binary(len, &bin);
+  ERL_NIF_TERM term;
+  unsigned char *buf = enif_make_new_binary(e, len, &term);
+  if (!buf)
+    return enif_make_atom(e, "out_of_memory");
   if (len > 0)
-    memcpy(bin.data, data, len);
-  return enif_make_binary(e, &bin);
+    memcpy(buf, data, len);
+  return term;
 }
 
 static ERL_NIF_TERM pho_make_string(ErlNifEnv *e, NSString *s) {
@@ -346,7 +349,7 @@ static ERL_NIF_TERM nif_media_list(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     return enif_make_atom(env, "ok");
 }
 
-// ── Thumbnail (synchronous, dirty IO) ─────────────────────────────────────
+// ── Thumbnail (GCD worker; reply sent to the receiver) ───────────────────
 
 static NSDictionary *pho_error(NSString *code) { return @{@"error" : code ?: @"unknown error"}; }
 
@@ -395,7 +398,9 @@ static NSDictionary *pho_thumbnail_from_source(CGImageSourceRef src, NSString *c
   [[NSFileManager defaultManager] createDirectoryAtPath:caches withIntermediateDirectories:YES attributes:nil error:nil];
   NSString *path = [caches stringByAppendingPathComponent:
                                [NSString stringWithFormat:@"mob_thumb_%@.jpg", pho_request_hash(cacheKey)]];
-  NSString *tmp = [path stringByAppendingString:@".tmp"];
+  // Unique per call, so concurrent requests for the same thumbnail can't
+  // truncate each other's output before the rename.
+  NSString *tmp = [path stringByAppendingFormat:@".%@.tmp", [NSUUID UUID].UUIDString];
   CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
       (__bridge CFURLRef)[NSURL fileURLWithPath:tmp], (__bridge CFStringRef)UTTypeJPEG.identifier, 1, NULL);
   if (!dst) {
@@ -424,20 +429,26 @@ static NSDictionary *pho_thumbnail_from_source(CGImageSourceRef src, NSString *c
       reply[@"mime"] = mime;
   }
 
+  // Each time tag has its own offset tag; keep them paired.
   NSDictionary *exif = props[(NSString *)kCGImagePropertyExifDictionary];
-  NSString *dt = pho_string(exif[(NSString *)kCGImagePropertyExifDateTimeOriginal])
-                     ?: pho_string(exif[(NSString *)kCGImagePropertyExifDateTimeDigitized]);
+  NSString *dt = pho_string(exif[(NSString *)kCGImagePropertyExifDateTimeOriginal]);
+  NSString *offset = pho_string(exif[(NSString *)kCGImagePropertyExifOffsetTimeOriginal]);
+  if (!dt) {
+    dt = pho_string(exif[(NSString *)kCGImagePropertyExifDateTimeDigitized]);
+    offset = pho_string(exif[(NSString *)kCGImagePropertyExifOffsetTimeDigitized]);
+  }
   if (dt)
     reply[@"exif_datetime"] = dt;
-  NSString *offset = pho_string(exif[(NSString *)kCGImagePropertyExifOffsetTimeOriginal]);
-  if (offset)
+  if (dt && offset)
     reply[@"exif_offset"] = offset;
 
   // An asset's PHAsset.location (set by the caller) wins over EXIF GPS.
+  // NSJSONSerialization throws on NaN/Inf, so only finite values go in.
   NSDictionary *gps = props[(NSString *)kCGImagePropertyGPSDictionary];
   NSNumber *lat = gps[(NSString *)kCGImagePropertyGPSLatitude];
   NSNumber *lon = gps[(NSString *)kCGImagePropertyGPSLongitude];
-  if (!reply[@"latitude"] && [lat isKindOfClass:[NSNumber class]] && [lon isKindOfClass:[NSNumber class]]) {
+  if (!reply[@"latitude"] && [lat isKindOfClass:[NSNumber class]] && [lon isKindOfClass:[NSNumber class]] &&
+      isfinite(lat.doubleValue) && isfinite(lon.doubleValue)) {
     double la = lat.doubleValue, lo = lon.doubleValue;
     if ([pho_string(gps[(NSString *)kCGImagePropertyGPSLatitudeRef]) isEqualToString:@"S"])
       la = -la;
@@ -446,7 +457,7 @@ static NSDictionary *pho_thumbnail_from_source(CGImageSourceRef src, NSString *c
     reply[@"latitude"] = @(la);
     reply[@"longitude"] = @(lo);
     NSNumber *alt = gps[(NSString *)kCGImagePropertyGPSAltitude];
-    if ([alt isKindOfClass:[NSNumber class]]) {
+    if ([alt isKindOfClass:[NSNumber class]] && isfinite(alt.doubleValue)) {
       double a = alt.doubleValue;
       if ([gps[(NSString *)kCGImagePropertyGPSAltitudeRef] intValue] == 1)
         a = -a;
@@ -482,7 +493,8 @@ static NSDictionary *pho_thumbnail_file(NSString *path, NSString *cacheKey, long
   return res;
 }
 
-static NSDictionary *pho_thumbnail_asset(NSString *localId, NSString *cacheKey, long maxSize, int quality) {
+static NSDictionary *pho_thumbnail_asset(NSString *localId, NSString *cacheKey, long maxSize, int quality,
+                                         long timeoutMs) {
   if (!pho_library_readable())
     return pho_error(@"permission");
   PHAsset *asset = [PHAsset fetchAssetsWithLocalIdentifiers:@[ localId ] options:nil].firstObject;
@@ -492,17 +504,19 @@ static NSDictionary *pho_thumbnail_asset(NSString *localId, NSString *cacheKey, 
     return pho_error(@"unsupported");
 
   // The original bytes (not a rendered UIImage), so ImageIO sees the EXIF.
-  // Synchronous is fine here: this runs on a dirty scheduler thread, never
-  // the main thread. iCloud-only originals are downloaded.
+  // iCloud-only originals are downloaded, so the request is asynchronous
+  // (a synchronous one can't be cancelled) and bounded by the caller's
+  // timeout. This thread is a GCD worker, never main, so waiting is fine.
   PHImageRequestOptions *ro = [[PHImageRequestOptions alloc] init];
-  ro.synchronous = YES;
+  ro.synchronous = NO;
   ro.networkAccessAllowed = YES;
   ro.version = PHImageRequestOptionsVersionCurrent;
   ro.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
+  dispatch_semaphore_t done = dispatch_semaphore_create(0);
   __block NSData *data = nil;
   __block NSString *dataUTI = nil;
   __block NSError *err = nil;
-  [[PHImageManager defaultManager]
+  PHImageRequestID rid = [[PHImageManager defaultManager]
       requestImageDataAndOrientationForAsset:asset
                                      options:ro
                                resultHandler:^(NSData *d, NSString *uti, CGImagePropertyOrientation o,
@@ -510,7 +524,12 @@ static NSDictionary *pho_thumbnail_asset(NSString *localId, NSString *cacheKey, 
                                  data = d;
                                  dataUTI = uti;
                                  err = info[PHImageErrorKey];
+                                 dispatch_semaphore_signal(done);
                                }];
+  if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMs * NSEC_PER_MSEC)) != 0) {
+    [[PHImageManager defaultManager] cancelImageRequest:rid];
+    return pho_error(@"timeout");
+  }
   if (!data)
     return pho_error(err ? err.localizedDescription : @"could not load the asset's image data");
 
@@ -523,10 +542,11 @@ static NSDictionary *pho_thumbnail_asset(NSString *localId, NSString *cacheKey, 
     reply[@"date_taken_ms"] = @((long long)(asset.creationDate.timeIntervalSince1970 * 1000.0));
   // Plain property reads (message sends) — no CoreLocation symbol to link.
   CLLocation *loc = asset.location;
-  if (loc && loc.horizontalAccuracy >= 0) {
+  if (loc && loc.horizontalAccuracy >= 0 && isfinite(loc.coordinate.latitude) &&
+      isfinite(loc.coordinate.longitude)) {
     reply[@"latitude"] = @(loc.coordinate.latitude);
     reply[@"longitude"] = @(loc.coordinate.longitude);
-    if (loc.verticalAccuracy > 0)
+    if (loc.verticalAccuracy > 0 && isfinite(loc.altitude))
       reply[@"altitude"] = @(loc.altitude);
   }
   CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
@@ -537,41 +557,70 @@ static NSDictionary *pho_thumbnail_asset(NSString *localId, NSString *cacheKey, 
   return res;
 }
 
-// photo_thumbnail(RequestJson) -> ReplyJson. Flagged ERL_NIF_DIRTY_JOB_IO_BOUND
-// in nif_funcs: it decodes a full-size image (and may wait on Photos), so it
-// must never run on a normal scheduler.
+static long pho_long(id v, long fallback) {
+  return [v isKindOfClass:[NSNumber class]] ? [v longValue] : fallback;
+}
+
+static NSData *pho_thumbnail_reply(NSData *requestJson) {
+  NSDictionary *req = [NSJSONSerialization JSONObjectWithData:requestJson options:0 error:nil];
+  NSDictionary *reply;
+  if (![req isKindOfClass:[NSDictionary class]]) {
+    reply = pho_error(@"invalid thumbnail request");
+  } else {
+    NSString *kind = pho_string(req[@"kind"]) ?: @"";
+    NSString *source = pho_string(req[@"source"]) ?: @"";
+    long maxSize = MAX(1L, pho_long(req[@"max_size"], 1280));
+    int quality = (int)MIN(100L, MAX(1L, pho_long(req[@"quality"], 80)));
+    long timeoutMs = MAX(1L, pho_long(req[@"timeout_ms"], 30000));
+    NSString *key = [NSString stringWithFormat:@"%@\n%@\n%ld\n%d", kind, source, maxSize, quality];
+    if ([kind isEqualToString:@"file"])
+      reply = pho_thumbnail_file(source, key, maxSize, quality);
+    else if ([kind isEqualToString:@"asset"])
+      reply = pho_thumbnail_asset(source, key, maxSize, quality, timeoutMs);
+    else if ([kind isEqualToString:@"content"])
+      reply = pho_error(@"content:// URIs are Android-only; on iOS pass a file path or a ph:// asset id");
+    else
+      reply = pho_error([@"unknown source kind: " stringByAppendingString:kind]);
+  }
+  NSData *json = nil;
+  if ([NSJSONSerialization isValidJSONObject:reply])
+    json = [NSJSONSerialization dataWithJSONObject:reply options:0 error:nil];
+  return json ?: [@"{\"error\":\"could not encode the thumbnail reply\"}" dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+// photo_thumbnail(Receiver, RequestJson) -> ok. Only QUEUES the work: the
+// decode (and any Photos/iCloud wait) runs on a GCD queue, never on a BEAM
+// scheduler (the VM has a single dirty-IO scheduler; holding it would stall
+// every file operation). The JSON reply goes to Receiver as
+// {mob_photos_thumbnail, Json}.
 static ERL_NIF_TERM nif_photo_thumbnail(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
-    ErlNifBinary bin;
-    if (!enif_inspect_binary(env, argv[0], &bin) && !enif_inspect_iolist_as_binary(env, argv[0], &bin))
+    ErlNifPid pid;
+    if (!enif_get_local_pid(env, argv[0], &pid))
         return enif_make_badarg(env);
-    @autoreleasepool {
-        NSDictionary *req = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:bin.data length:bin.size]
-                                                            options:0
-                                                              error:nil];
-        NSDictionary *reply;
-        if (![req isKindOfClass:[NSDictionary class]]) {
-            reply = pho_error(@"invalid thumbnail request");
-        } else {
-            NSString *kind = pho_string(req[@"kind"]) ?: @"";
-            NSString *source = pho_string(req[@"source"]) ?: @"";
-            long maxSize = MAX(1L, [req[@"max_size"] longValue]);
-            int quality = MIN(100, MAX(1, [req[@"quality"] intValue]));
-            NSString *key = [NSString stringWithFormat:@"%@\n%@\n%ld\n%d", kind, source, maxSize, quality];
-            if ([kind isEqualToString:@"file"])
-                reply = pho_thumbnail_file(source, key, maxSize, quality);
-            else if ([kind isEqualToString:@"asset"])
-                reply = pho_thumbnail_asset(source, key, maxSize, quality);
-            else if ([kind isEqualToString:@"content"])
-                reply = pho_error(@"content:// URIs are Android-only; on iOS pass a file path or a ph:// asset id");
-            else
-                reply = pho_error([@"unknown source kind: " stringByAppendingString:kind]);
-        }
-        NSData *json = [NSJSONSerialization dataWithJSONObject:reply options:0 error:nil];
-        if (!json)
-            json = [@"{\"error\":\"could not encode the thumbnail reply\"}" dataUsingEncoding:NSUTF8StringEncoding];
-        return pho_make_binary(env, json.bytes, json.length);
-    }
+    ErlNifBinary bin;
+    if (!enif_inspect_binary(env, argv[1], &bin) && !enif_inspect_iolist_as_binary(env, argv[1], &bin))
+        return enif_make_badarg(env);
+    NSData *request = [NSData dataWithBytes:bin.data length:bin.size];
+    // At most two full-size decodes at once (Android uses a two-thread pool).
+    static dispatch_semaphore_t slots;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+      slots = dispatch_semaphore_create(2);
+    });
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      dispatch_semaphore_wait(slots, DISPATCH_TIME_FOREVER);
+      @autoreleasepool {
+        NSData *json = pho_thumbnail_reply(request);
+        ErlNifEnv *e = enif_alloc_env();
+        ERL_NIF_TERM msg = enif_make_tuple2(e, enif_make_atom(e, "mob_photos_thumbnail"),
+                                            pho_make_binary(e, json.bytes, json.length));
+        enif_send(NULL, &pid, e, msg);
+        enif_free_env(e);
+      }
+      dispatch_semaphore_signal(slots);
+    });
+    return enif_make_atom(env, "ok");
 }
 
 // ── Registration ──────────────────────────────────────────────────────────
@@ -588,7 +637,7 @@ static int pho_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
 static ErlNifFunc nif_funcs[] = {
     {"photos_pick", 2, nif_photos_pick, 0},
     {"media_list", 1, nif_media_list, 0},
-    {"photo_thumbnail", 1, nif_photo_thumbnail, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"photo_thumbnail", 2, nif_photo_thumbnail, 0},
 };
 
 ERL_NIF_INIT(mob_photos_nif, nif_funcs, pho_load, NULL, NULL, NULL)

@@ -56,7 +56,15 @@ import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicLong
 
 object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissionProvider {
-    private var activityRef: WeakReference<Activity>? = null
+    @Volatile private var activityRef: WeakReference<Activity>? = null
+
+    // Process-lifetime, so thumbnails of plain files keep working after the
+    // Activity is destroyed while the BEAM lives on.
+    @Volatile private var appContext: Context? = null
+
+    // Thumbnail decodes run here, never on a BEAM scheduler thread. Two
+    // workers bound the memory of concurrent full-size decodes.
+    private val thumbnailPool = java.util.concurrent.Executors.newFixedThreadPool(2)
 
     @JvmStatic external fun nativeRegister()
 
@@ -77,10 +85,18 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
         json: String,
     )
 
+    // {:mob_photos_thumbnail, reply_json} to the receiver pid given to the
+    // photo_thumbnail NIF; MobPhotos.thumbnail/2 waits for it.
+    @JvmStatic external fun nativeDeliverThumbnail(
+        pid: Long,
+        reply: ByteArray,
+    )
+
     @JvmStatic fun register() = nativeRegister()
 
     override fun setActivity(activity: Activity) {
         activityRef = WeakReference(activity)
+        appContext = activity.applicationContext
     }
 
     // The :media capability maps to READ_MEDIA_IMAGES + READ_MEDIA_VIDEO on
@@ -336,15 +352,27 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
         }
     }
 
-    // ── Thumbnail (synchronous) ────────────────────────────────────────────
-    // Signature matches what the zig NIF calls: ([B)[B — UTF-8 JSON request
-    // {"kind":"file"|"content"|"asset","source":…,"max_size":N,"quality":Q}
-    // in, UTF-8 JSON reply out. Runs on the calling thread: the NIF is a
-    // dirty-IO NIF, so this never occupies a normal BEAM scheduler. Never
-    // throws — every failure becomes {"error": …}, decoded by
-    // MobPhotos.decode_thumbnail_result/1.
+    // ── Thumbnail ──────────────────────────────────────────────────────────
+    // Signature matches what the zig NIF calls: (J[B)V — the receiver pid and
+    // a UTF-8 JSON request
+    // {"kind":"file"|"content"|"asset","source":…,"max_size":N,"quality":Q}.
+    // Returns at once: the decode runs on thumbnailPool (never a BEAM
+    // scheduler thread) and the UTF-8 JSON reply goes back through
+    // nativeDeliverThumbnail. Never throws — every failure becomes
+    // {"error": …}, decoded by MobPhotos.decode_thumbnail_result/1.
     @JvmStatic
-    fun photo_thumbnail(request: ByteArray): ByteArray {
+    fun photo_thumbnail(
+        pid: Long,
+        request: ByteArray,
+    ) {
+        try {
+            thumbnailPool.execute { nativeDeliverThumbnail(pid, thumbnailReply(request)) }
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            nativeDeliverThumbnail(pid, errorReply("thumbnail worker unavailable"))
+        }
+    }
+
+    private fun thumbnailReply(request: ByteArray): ByteArray {
         val reply =
             try {
                 thumbnail(JSONObject(String(request, Charsets.UTF_8)))
@@ -362,13 +390,19 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
         return reply.toString().toByteArray(Charsets.UTF_8)
     }
 
+    private fun errorReply(message: String): ByteArray =
+        JSONObject().put("error", message).toString().toByteArray(Charsets.UTF_8)
+
     private class ThumbError(
         val code: String,
     ) : Exception(code)
 
+    // Scoped storage reports an unreadable path as EACCES (or EPERM); a file
+    // that isn't there is ENOENT. File.exists() can't tell them apart: it is
+    // false for both.
     private fun isPermissionDenied(e: FileNotFoundException): Boolean {
         val msg = e.message ?: return false
-        return msg.contains("EACCES") || msg.contains("Permission denied")
+        return msg.contains("EACCES") || msg.contains("EPERM") || msg.contains("Permission denied")
     }
 
     // Where the bytes come from: a plain file, or a content:// URI (for
@@ -387,10 +421,7 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
     private class FileThumbSource(
         val file: File,
     ) : ThumbSource {
-        override fun open(): InputStream {
-            if (!file.exists()) throw ThumbError("not_found")
-            return file.inputStream()
-        }
+        override fun open(): InputStream = file.inputStream()
 
         override fun size(): Long? = file.length().takeIf { it > 0 }
 
@@ -435,9 +466,7 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
     }
 
     private fun thumbnail(req: JSONObject): JSONObject {
-        val ctx =
-            activityRef?.get()?.applicationContext
-                ?: throw ThumbError("mob_photos bridge has no activity yet")
+        val ctx = appContext ?: throw ThumbError("mob_photos bridge has no context yet")
         val kind = req.getString("kind")
         val sourceStr = req.getString("source")
         val maxSize = req.optInt("max_size", 1280).coerceAtLeast(1)
@@ -471,46 +500,58 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
         val decoded =
             source.open().use { BitmapFactory.decodeStream(it, null, decodeOpts) }
                 ?: throw ThumbError("unsupported")
-        val scale = minOf(1f, maxSize.toFloat() / maxOf(decoded.width, decoded.height))
-        val matrix = Matrix().apply { postScale(scale, scale) }
-        applyOrientation(matrix, orientation)
-        var thumb = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
-        if (thumb !== decoded) decoded.recycle()
-        if (thumb.hasAlpha()) {
-            // JPEG has no alpha: transparent pixels would turn black.
-            val opaque = Bitmap.createBitmap(thumb.width, thumb.height, Bitmap.Config.ARGB_8888)
-            Canvas(opaque).apply {
-                drawColor(Color.WHITE)
-                drawBitmap(thumb, 0f, 0f, null)
+        var thumb = decoded
+        try {
+            // Never upscale; never shrink the short side below 1 px (a
+            // 10000x5 strip at max_size 100 would otherwise round to 0).
+            val scale =
+                minOf(1f, maxSize.toFloat() / maxOf(decoded.width, decoded.height))
+                    .coerceAtLeast(1f / minOf(decoded.width, decoded.height))
+            val matrix = Matrix().apply { postScale(scale, scale) }
+            applyOrientation(matrix, orientation)
+            thumb = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+            if (thumb !== decoded) decoded.recycle()
+            if (thumb.hasAlpha()) {
+                // JPEG has no alpha: transparent pixels would turn black.
+                val opaque = Bitmap.createBitmap(thumb.width, thumb.height, Bitmap.Config.ARGB_8888)
+                Canvas(opaque).apply {
+                    drawColor(Color.WHITE)
+                    drawBitmap(thumb, 0f, 0f, null)
+                }
+                thumb.recycle()
+                thumb = opaque
             }
-            thumb.recycle()
-            thumb = opaque
-        }
 
-        // 4. Write to the cache dir under a name derived from the request, so
-        //    a repeat request overwrites instead of accumulating files.
-        val out = File(ctx.cacheDir, "mob_thumb_${digest("$kind\n$sourceStr\n$maxSize\n$quality")}.jpg")
-        val tmp = File(out.path + ".tmp")
-        tmp.outputStream().use { thumb.compress(Bitmap.CompressFormat.JPEG, quality, it) }
-        if (!tmp.renameTo(out)) {
-            tmp.delete()
-            throw ThumbError("could not write ${out.path}")
-        }
-        val reply =
-            JSONObject()
-                .put("path", out.absolutePath)
-                .put("width", thumb.width)
-                .put("height", thumb.height)
-        thumb.recycle()
+            // 4. Write to the cache dir under a name derived from the request,
+            //    so a repeat request overwrites instead of accumulating files.
+            //    The temp file is unique per call, so concurrent requests for
+            //    the same thumbnail can't truncate each other's output.
+            val out = File(ctx.cacheDir, "mob_thumb_${digest("$kind\n$sourceStr\n$maxSize\n$quality")}.jpg")
+            val tmp = File.createTempFile("mob_thumb_", ".tmp", ctx.cacheDir)
+            try {
+                val written = tmp.outputStream().use { thumb.compress(Bitmap.CompressFormat.JPEG, quality, it) }
+                if (!written || !tmp.renameTo(out)) throw ThumbError("could not write ${out.path}")
+            } finally {
+                tmp.delete() // no-op after a successful rename
+            }
+            val reply =
+                JSONObject()
+                    .put("path", out.absolutePath)
+                    .put("width", thumb.width)
+                    .put("height", thumb.height)
 
-        val swap = orientation in 5..8
-        reply.put("orig_width", if (swap) bounds.outHeight else bounds.outWidth)
-        reply.put("orig_height", if (swap) bounds.outWidth else bounds.outHeight)
-        reply.putOpt("mime", bounds.outMimeType ?: source.mime())
-        reply.putOpt("size", source.size())
-        reply.putOpt("date_taken_ms", source.dateTakenMs())
-        if (exif != null) putExif(reply, exif)
-        return reply
+            val swap = orientation in 5..8
+            reply.put("orig_width", if (swap) bounds.outHeight else bounds.outWidth)
+            reply.put("orig_height", if (swap) bounds.outWidth else bounds.outHeight)
+            reply.putOpt("mime", bounds.outMimeType ?: source.mime())
+            reply.putOpt("size", source.size())
+            reply.putOpt("date_taken_ms", source.dateTakenMs())
+            if (exif != null) putExif(reply, exif)
+            return reply
+        } finally {
+            if (!decoded.isRecycled) decoded.recycle()
+            if (!thumb.isRecycled) thumb.recycle()
+        }
     }
 
     // EXIF orientation 1..8 -> the transform that makes the pixels upright.
@@ -542,12 +583,17 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
         reply: JSONObject,
         exif: ExifInterface,
     ) {
-        reply.putOpt(
-            "exif_datetime",
-            exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
-                ?: exif.getAttribute(ExifInterface.TAG_DATETIME_DIGITIZED),
-        )
-        reply.putOpt("exif_offset", exif.getAttribute("OffsetTimeOriginal"))
+        // Each time tag has its own offset tag; keep them paired. (Offset tags
+        // are EXIF 2.31 — older platform ExifInterface versions don't read
+        // them, and taken_at then falls back per the precedence above.)
+        val original = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+        if (original != null) {
+            reply.put("exif_datetime", original)
+            reply.putOpt("exif_offset", exif.getAttribute("OffsetTimeOriginal"))
+        } else {
+            reply.putOpt("exif_datetime", exif.getAttribute(ExifInterface.TAG_DATETIME_DIGITIZED))
+            reply.putOpt("exif_offset", exif.getAttribute("OffsetTimeDigitized"))
+        }
         val lat = gpsDegrees(exif, ExifInterface.TAG_GPS_LATITUDE, ExifInterface.TAG_GPS_LATITUDE_REF, "S")
         val lon = gpsDegrees(exif, ExifInterface.TAG_GPS_LONGITUDE, ExifInterface.TAG_GPS_LONGITUDE_REF, "W")
         if (lat != null && lon != null) {

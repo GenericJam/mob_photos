@@ -5,8 +5,9 @@
 //! Kotlin side is the plugin-owned bridge class `io.mob.photos.MobPhotosBridge`
 //! (system Photo Picker: PickVisualMedia / PickMultipleVisualMedia activity
 //! contracts). Pick results arrive back via the exported deliver thunks.
-//! photo_thumbnail is the one synchronous NIF: a dirty-IO call into the
-//! bridge's photo_thumbnail(byte[]) -> byte[] (JSON request / JSON reply).
+//! photo_thumbnail(receiver, json) hands a JSON request to the bridge's
+//! worker pool; the JSON reply comes back through nativeDeliverThumbnail as
+//! {:mob_photos_thumbnail, json}.
 //!
 //! Delivered message shapes (exact core parity):
 //!   * cancelled -> {:photos, :cancelled}
@@ -48,9 +49,9 @@ export fn Java_io_mob_photos_MobPhotosBridge_nativeRegister(jenv: *jni.JNIEnv, c
     if (g_photos_cls == null) return;
     g_photos.photos_pick = jni.getStaticMethodID(jenv, cls, "photos_pick", "(JLjava/lang/String;)V");
     g_photos.media_list = jni.getStaticMethodID(jenv, cls, "media_list", "(JLjava/lang/String;)V");
-    // byte[] in/out (not jstrings): NewStringUTF wants modified UTF-8, byte
-    // arrays round-trip UTF-8 JSON verbatim (paths/names can be non-BMP).
-    g_photos.photo_thumbnail = jni.getStaticMethodID(jenv, cls, "photo_thumbnail", "([B)[B");
+    // byte[] (not jstrings): NewStringUTF wants modified UTF-8, byte arrays
+    // round-trip UTF-8 JSON verbatim (paths/names can be non-BMP).
+    g_photos.photo_thumbnail = jni.getStaticMethodID(jenv, cls, "photo_thumbnail", "(J[B)V");
 }
 
 // ── Thread-attach + pid round-trip helpers (mirror mob-core / camera) ─────
@@ -246,19 +247,7 @@ fn termToByteArray(env: ?*erts.ErlNifEnv, jenv: *jni.JNIEnv, term: erts.ERL_NIF_
     return arr;
 }
 
-/// Java byte[] -> Erlang binary term.
-fn byteArrayToTerm(env: ?*erts.ErlNifEnv, jenv: *jni.JNIEnv, arr: jni.JByteArray) ?erts.ERL_NIF_TERM {
-    const len_j = jni.getArrayLength(jenv, arr);
-    if (len_j < 0) return null;
-    var bin: erts.ErlNifBinary = undefined;
-    if (erts.enif_alloc_binary(@intCast(len_j), &bin) == 0) return null;
-    if (len_j > 0) {
-        jni.getByteArrayRegion(jenv, arr, 0, len_j, @ptrCast(bin.data));
-    }
-    return erts.enif_make_binary(env, &bin);
-}
-
-/// A literal JSON reply, for failures before/around the bridge call.
+/// A literal JSON reply, for failures before the work is queued.
 fn literalBinary(env: ?*erts.ErlNifEnv, comptime json: []const u8) erts.ERL_NIF_TERM {
     var bin: erts.ErlNifBinary = undefined;
     if (erts.enif_alloc_binary(json.len, &bin) == 0) return erts.badarg(env);
@@ -266,27 +255,52 @@ fn literalBinary(env: ?*erts.ErlNifEnv, comptime json: []const u8) erts.ERL_NIF_
     return erts.enif_make_binary(env, &bin);
 }
 
-// photo_thumbnail(request_json) -> reply_json. SYNCHRONOUS: the bridge
-// decodes + downscales the image on this thread, so the NIF is flagged
-// ERL_NIF_DIRTY_JOB_IO_BOUND (see nif_funcs) and never runs on a normal
-// scheduler. The bridge class is a cached global ref, so calling it from a
-// dirty-scheduler thread (attached by get_jenv) is safe — no FindClass here.
+// photo_thumbnail(receiver_pid, request_json) -> ok | reply_json. Only QUEUES
+// the work: the bridge runs the decode on its own worker thread and answers
+// via nativeDeliverThumbnail below, so no BEAM scheduler (normal or dirty —
+// the VM runs a single dirty-IO scheduler) ever waits on BitmapFactory. A
+// JSON reply is returned directly only when the work can't be queued.
 fn nif_photo_thumbnail(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
     _ = argc;
+    var pid: erts.ErlNifPid = undefined;
+    if (erts.enif_get_local_pid(env, argv[0], &pid) == 0) return erts.badarg(env);
     if (g_photos_cls == null or g_photos.photo_thumbnail == null)
         return literalBinary(env, "{\"error\":\"mob_photos bridge not registered\"}");
     var attached: c_int = 0;
     const jenv = get_jenv(&attached) orelse return literalBinary(env, "{\"error\":\"no JNI env\"}");
     defer detachIfAttached(attached);
-    const req = termToByteArray(env, jenv, argv[0]) orelse return erts.badarg(env);
+    const req = termToByteArray(env, jenv, argv[1]) orelse {
+        jni.exceptionClear(jenv); // a failed NewByteArray leaves an OOM pending
+        return erts.badarg(env);
+    };
     defer jni.deleteLocalRef(jenv, req);
-    const result = jenv.*.CallStaticObjectMethod.?(jenv, g_photos_cls, g_photos.photo_thumbnail, req);
-    // The bridge catches everything itself; this only guards a JNI-level
-    // failure (e.g. OOM) — a pending exception leaves result null.
+    jenv.*.CallStaticVoidMethod.?(jenv, g_photos_cls, g_photos.photo_thumbnail, pidToJlong(pid), req);
+    // The bridge only hands the request to its executor and catches
+    // everything itself; this guards a JNI-level failure (e.g. a rejected
+    // execution or OOM) so the exception doesn't leak into the next call.
     jni.exceptionClear(jenv);
-    if (result == null) return literalBinary(env, "{\"error\":\"thumbnail bridge returned null\"}");
-    defer jni.deleteLocalRef(jenv, result);
-    return byteArrayToTerm(env, jenv, result) orelse literalBinary(env, "{\"error\":\"thumbnail reply copy failed\"}");
+    return erts.ok(env);
+}
+
+// {:mob_photos_thumbnail, reply_json} to the receiver pid passed to
+// photo_thumbnail/2. Called from the bridge's worker thread.
+export fn Java_io_mob_photos_MobPhotosBridge_nativeDeliverThumbnail(
+    jenv: *jni.JNIEnv,
+    cls: jni.JClass,
+    pid_long: jni.JLong,
+    reply: jni.JByteArray,
+) callconv(.c) void {
+    _ = cls;
+    var pid = pidFromLong(pid_long);
+    const env = erts.enif_alloc_env() orelse return;
+    defer erts.enif_free_env(env);
+    const len_j = jni.getArrayLength(jenv, reply);
+    if (len_j < 0) return;
+    var bin: erts.ErlNifBinary = undefined;
+    if (erts.enif_alloc_binary(@intCast(len_j), &bin) == 0) return;
+    if (len_j > 0) jni.getByteArrayRegion(jenv, reply, 0, len_j, @ptrCast(bin.data));
+    const msg = erts.makeTuple(env, .{ erts.atom(env, "mob_photos_thumbnail"), erts.enif_make_binary(env, &bin) });
+    _ = erts.enif_send(null, &pid, env, msg);
 }
 
 // ── NIF table + init entry point ─────────────────────────────────────────
@@ -300,7 +314,7 @@ fn nifLoad(env: ?*erts.ErlNifEnv, priv: *?*anyopaque, info: erts.ERL_NIF_TERM) c
 const nif_funcs = [_]erts.ErlNifFunc{
     .{ .name = "photos_pick", .arity = 2, .fptr = nif_photos_pick, .flags = 0 },
     .{ .name = "media_list", .arity = 1, .fptr = nif_media_list, .flags = 0 },
-    .{ .name = "photo_thumbnail", .arity = 1, .fptr = nif_photo_thumbnail, .flags = erts.ERL_NIF_DIRTY_JOB_IO_BOUND },
+    .{ .name = "photo_thumbnail", .arity = 2, .fptr = nif_photo_thumbnail, .flags = 0 },
 };
 
 var nif_entry: erts.ErlNifEntry = .{

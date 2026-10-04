@@ -12,7 +12,7 @@
 %% the failure and the NIFs fall back to nif_error until the native merge links
 %% one.
 -module(mob_photos_nif).
--export([photos_pick/2, media_list/1, photo_thumbnail/1]).
+-export([photos_pick/2, media_list/1, photo_thumbnail/2]).
 -on_load(init/0).
 
 init() ->
@@ -30,8 +30,9 @@ photos_pick(_Max, _Types) ->
 media_list(_OptsJson) ->
     erlang:nif_error(nif_not_loaded).
 
-%% Downscaled JPEG + metadata for one image. Synchronous, dirty IO scheduler.
-%% Takes a JSON request binary, returns a JSON reply binary (decoded by
-%% MobPhotos.decode_thumbnail_result/1).
-photo_thumbnail(_RequestJson) ->
+%% Downscaled JPEG + metadata for one image. Queues the work on a native
+%% thread and returns ok at once (or a JSON error reply binary when it can't
+%% be queued); the JSON reply arrives later at Receiver as
+%% {mob_photos_thumbnail, Json}. MobPhotos.thumbnail/2 waits for it.
+photo_thumbnail(_Receiver, _RequestJson) ->
     erlang:nif_error(nif_not_loaded).

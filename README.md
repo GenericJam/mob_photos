@@ -78,9 +78,10 @@ platform doesn't know them — read them with `item[:date_taken]`.
 ```
 
 `source` can be an absolute path (e.g. a picked item's `path`), an Android
-`content://` URI or an iOS `ph://` id. The call blocks the caller while it
-decodes (on a dirty IO scheduler, never a normal one). Errors:
-`{:error, :not_found | :unsupported | :permission}` or `{:error, message}`.
+`content://` URI or an iOS `ph://` id. The caller waits while the image is
+decoded on a native worker thread (never a BEAM scheduler). Errors:
+`{:error, :not_found | :unsupported | :permission | :timeout}` or
+`{:error, message}`.
 
 ## Limits
 

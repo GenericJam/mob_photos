@@ -96,6 +96,7 @@ defmodule MobPhotos do
 
   @default_max_size 1280
   @default_quality 80
+  @default_timeout 30_000
 
   @typedoc "Metadata returned by `thumbnail/2`."
   @type thumbnail_info :: %{
@@ -178,10 +179,11 @@ defmodule MobPhotos do
 
   @doc """
   Write a downscaled, upright JPEG of an image and return it with the image's
-  metadata. **Synchronous** — it decodes the full-size image on a dirty IO
-  scheduler, so it never blocks a normal scheduler, but it does block the
-  caller (typically tens to a few hundred ms); call it from a `Task` if the
-  caller must stay responsive.
+  metadata. **Synchronous**: the caller waits (typically tens to a few hundred
+  ms; longer if iOS must download an iCloud original). The decode itself runs
+  on a native thread (a GCD queue on iOS, a small worker pool on Android),
+  never on a BEAM scheduler, so a slow image doesn't hold up other processes
+  or the VM's file I/O; only the calling process waits.
 
   `source` is one of:
 
@@ -196,11 +198,14 @@ defmodule MobPhotos do
   dir, so use the file promptly or copy it.
 
   Options:
-    - `max_size:` longest side of the thumbnail in pixels (default `1280`).
-      Images already smaller are not upscaled.
+    - `max_size:` longest side of the thumbnail in pixels, `1..16384`
+      (default `1280`). Images already smaller are not upscaled.
     - `quality:` JPEG quality `1..100` (default `80`), handed to the platform
       encoder (Android `Bitmap.compress`, iOS ImageIO as `quality / 100`), so
       the same value gives somewhat different file sizes per platform
+    - `timeout:` milliseconds to wait (default `30_000`). iOS cancels a pending
+      iCloud download at this point; on Android a decode that overruns
+      finishes in the background and its result is dropped.
 
   On success returns `{:ok, info}` (see `t:thumbnail_info/0`):
 
@@ -213,31 +218,69 @@ defmodule MobPhotos do
       UTC, else the bare EXIF local time without an offset
     * `latitude`, `longitude`, `altitude` (metres) — EXIF GPS, or the
       `PHAsset` location for `ph://` ids. Android only hands GPS to apps
-      holding `ACCESS_MEDIA_LOCATION` (granted with `:media`); without it they
-      are `nil`. A `(0, 0)` fix is treated as absent.
+      holding `ACCESS_MEDIA_LOCATION` (granted with `:media`), and its photo
+      picker zeroes GPS in the copies it hands out. A `(0, 0)` fix is treated
+      as absent.
     * `make`, `model` — camera EXIF
 
   Any metadata the image doesn't carry is `nil`.
 
   Errors: `{:error, :not_found}`, `{:error, :unsupported}` (not a decodable
   image — videos included), `{:error, :permission}` (library access not
-  granted), or `{:error, message}` with a string for anything else
-  (including a source this platform can't open, like a `ph://` id on
-  Android).
+  granted, or a file the app may not read), `{:error, :timeout}`, or
+  `{:error, message}` with a string for anything else (including a source
+  this platform can't open, like a `ph://` id on Android).
 
   Raises `ArgumentError` for an unknown option or an out-of-range value.
   """
   @spec thumbnail(String.t(), keyword()) ::
-          {:ok, thumbnail_info()} | {:error, :not_found | :unsupported | :permission | String.t()}
+          {:ok, thumbnail_info()}
+          | {:error, :not_found | :unsupported | :permission | :timeout | String.t()}
   def thumbnail(source, opts \\ []) when is_binary(source) do
     with {:ok, request} <- thumbnail_request(source, opts) do
-      request
-      |> :json.encode()
-      |> IO.iodata_to_binary()
-      |> :mob_photos_nif.photo_thumbnail()
-      |> decode_thumbnail_result()
+      request |> :json.encode() |> IO.iodata_to_binary() |> await_thumbnail(request["timeout_ms"])
     end
   end
+
+  # The NIF only queues the work and returns :ok (or a JSON error reply when it
+  # can't even queue it); the reply arrives as {:mob_photos_thumbnail, json}.
+  # It is addressed to a throwaway receiver, not the caller, so a reply that
+  # lands after the timeout dies with the receiver instead of turning up in
+  # the caller's mailbox (a Mob.Screen would hand it to handle_info).
+  defp await_thumbnail(request_json, timeout) do
+    caller = self()
+    tag = make_ref()
+    # Grace past the native timeout so iOS's own {"error":"timeout"} wins.
+    wait = timeout + 2_000
+
+    {receiver, mref} =
+      spawn_monitor(fn ->
+        receive do
+          {:mob_photos_thumbnail, json} -> send(caller, {tag, json})
+        after
+          wait -> :ok
+        end
+      end)
+
+    case :mob_photos_nif.photo_thumbnail(receiver, request_json) do
+      :ok ->
+        receive do
+          {^tag, json} ->
+            Process.demonitor(mref, [:flush])
+            decode_thumbnail_result(json)
+
+          {:DOWN, ^mref, :process, _pid, _reason} ->
+            {:error, :timeout}
+        end
+
+      json when is_binary(json) ->
+        Process.exit(receiver, :kill)
+        Process.demonitor(mref, [:flush])
+        decode_thumbnail_result(json)
+    end
+  end
+
+  @max_max_size 16_384
 
   @doc false
   # The JSON request handed to the photo_thumbnail NIF. Public (but
@@ -245,41 +288,78 @@ defmodule MobPhotos do
   # testable without the NIF.
   @spec thumbnail_request(String.t(), keyword()) :: {:ok, map()} | {:error, String.t()}
   def thumbnail_request(source, opts) when is_binary(source) do
-    opts = Keyword.validate!(opts, max_size: @default_max_size, quality: @default_quality)
+    opts =
+      Keyword.validate!(opts,
+        max_size: @default_max_size,
+        quality: @default_quality,
+        timeout: @default_timeout
+      )
+
     max_size = Keyword.fetch!(opts, :max_size)
     quality = Keyword.fetch!(opts, :quality)
+    timeout = Keyword.fetch!(opts, :timeout)
 
-    unless is_integer(max_size) and max_size > 0 do
-      raise ArgumentError, "max_size must be a positive integer, got: #{inspect(max_size)}"
+    unless is_integer(max_size) and max_size in 1..@max_max_size do
+      raise ArgumentError,
+            "max_size must be an integer in 1..#{@max_max_size}, got: #{inspect(max_size)}"
     end
 
     unless is_integer(quality) and quality in 1..100 do
       raise ArgumentError, "quality must be an integer in 1..100, got: #{inspect(quality)}"
     end
 
+    unless is_integer(timeout) and timeout > 0 do
+      raise ArgumentError, "timeout must be a positive integer (ms), got: #{inspect(timeout)}"
+    end
+
     with {:ok, kind, target} <- classify_source(source) do
-      {:ok, %{"kind" => kind, "source" => target, "max_size" => max_size, "quality" => quality}}
+      {:ok,
+       %{
+         "kind" => kind,
+         "source" => target,
+         "max_size" => max_size,
+         "quality" => quality,
+         "timeout_ms" => timeout
+       }}
     end
   end
 
-  defp classify_source("content://" <> rest = uri) when rest != "", do: {:ok, "content", uri}
-  defp classify_source("ph://" <> id) when id != "", do: {:ok, "asset", id}
-  defp classify_source("file://" <> _ = url), do: file_url_path(url)
-  defp classify_source("/" <> _ = path), do: {:ok, "file", path}
+  defp classify_source(source) do
+    if String.valid?(source) do
+      classify_valid_source(source)
+    else
+      {:error, "invalid source: not valid UTF-8"}
+    end
+  end
 
-  defp classify_source(other) do
+  defp classify_valid_source("content://" <> rest = uri) when rest != "",
+    do: {:ok, "content", uri}
+
+  defp classify_valid_source("ph://" <> id) when id != "", do: {:ok, "asset", id}
+  # file:///p, file://localhost/p and file:/p. Not URI.parse: it would cut an
+  # unencoded "#" or "?" (legal in file names) off as fragment/query.
+  defp classify_valid_source("file:///" <> rest = url), do: file_url("/" <> rest, url)
+  defp classify_valid_source("file://localhost/" <> rest = url), do: file_url("/" <> rest, url)
+
+  defp classify_valid_source("file://" <> _ = url),
+    do: {:error, "invalid source #{inspect(url)}: not a local file:// URL"}
+
+  defp classify_valid_source("file:/" <> rest = url), do: file_url("/" <> rest, url)
+  defp classify_valid_source("/" <> _ = path), do: {:ok, "file", path}
+
+  defp classify_valid_source(other) do
     {:error,
      "invalid source #{inspect(other)}: expected an absolute file path, a content:// URI or a ph:// asset id"}
   end
 
-  defp file_url_path(url) do
-    case URI.parse(url) do
-      %URI{host: host, path: "/" <> _ = path} when host in [nil, "", "localhost"] ->
-        {:ok, "file", URI.decode(path)}
+  defp file_url(encoded_path, url) do
+    path = URI.decode(encoded_path)
 
-      _ ->
-        {:error, "invalid source #{inspect(url)}: not a local file:// URL"}
-    end
+    if String.valid?(path),
+      do: {:ok, "file", path},
+      else: {:error, "invalid source #{inspect(url)}: path is not valid UTF-8"}
+  rescue
+    ArgumentError -> {:error, "invalid source #{inspect(url)}: malformed percent-encoding"}
   end
 
   @doc false
@@ -297,6 +377,7 @@ defmodule MobPhotos do
   defp decode_error("not_found"), do: :not_found
   defp decode_error("unsupported"), do: :unsupported
   defp decode_error("permission"), do: :permission
+  defp decode_error("timeout"), do: :timeout
   defp decode_error(message) when is_binary(message), do: message
 
   defp build_info(reply) do
@@ -356,7 +437,7 @@ defmodule MobPhotos do
 
     cond do
       naive && offset -> NaiveDateTime.to_iso8601(naive) <> offset
-      is_integer(date_taken_ms) and date_taken_ms > 0 -> unix_ms_to_iso8601(date_taken_ms)
+      platform = unix_ms_to_iso8601(date_taken_ms) -> platform
       naive -> NaiveDateTime.to_iso8601(naive)
       true -> nil
     end
@@ -391,14 +472,27 @@ defmodule MobPhotos do
     end
   end
 
-  # EXIF OffsetTimeOriginal: "+HH:MM" / "-HH:MM".
-  defp parse_exif_offset(<<sign, h1, h2, ":", m1, m2>> = offset)
-       when sign in [?+, ?-] and h1 in ?0..?9 and h2 in ?0..?9 and m1 in ?0..?9 and m2 in ?0..?9,
-       do: offset
+  # EXIF OffsetTimeOriginal: "+HH:MM" / "-HH:MM", within the real range of
+  # UTC offsets (-12:00..+14:00).
+  defp parse_exif_offset(<<sign, _, _, ":", _, _>> = offset) when sign in [?+, ?-] do
+    with [h, m] <- parse_ints([binary_part(offset, 1, 2), binary_part(offset, 4, 2)]),
+         true <- h <= 14 and m <= 59 do
+      offset
+    else
+      _ -> nil
+    end
+  end
 
   defp parse_exif_offset(_value), do: nil
 
-  defp unix_ms_to_iso8601(ms) do
-    ms |> div(1000) |> DateTime.from_unix!() |> DateTime.to_iso8601()
+  # A non-positive or absurd value (a row written in the wrong unit) is
+  # "unknown", not a crash.
+  defp unix_ms_to_iso8601(ms) when is_integer(ms) and ms > 0 do
+    case DateTime.from_unix(div(ms, 1000)) do
+      {:ok, datetime} -> DateTime.to_iso8601(datetime)
+      {:error, _} -> nil
+    end
   end
+
+  defp unix_ms_to_iso8601(_ms), do: nil
 end
