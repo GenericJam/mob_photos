@@ -12,7 +12,7 @@
 %% the failure and the NIFs fall back to nif_error until the native merge links
 %% one.
 -module(mob_photos_nif).
--export([photos_pick/2, media_list/1]).
+-export([photos_pick/2, media_list/1, photo_thumbnail/1]).
 -on_load(init/0).
 
 init() ->
@@ -24,8 +24,14 @@ init() ->
 photos_pick(_Max, _Types) ->
     erlang:nif_error(nif_not_loaded).
 
-%% Enumerate the media library. Async on Android: results land later as
-%% {:media, :listed, items} via the deliver thunk. iOS returns
-%% {error, unsupported} synchronously.
+%% Enumerate the media library. Async on both platforms: results land later
+%% as {:media, :listed, items} (via {mob_file_result, <<"media">>,
+%% <<"listed">>, Json}, decoded by core's Mob.Screen).
 media_list(_OptsJson) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% Downscaled JPEG + metadata for one image. Synchronous, dirty IO scheduler.
+%% Takes a JSON request binary, returns a JSON reply binary (decoded by
+%% MobPhotos.decode_thumbnail_result/1).
+photo_thumbnail(_RequestJson) ->
     erlang:nif_error(nif_not_loaded).

@@ -3,7 +3,7 @@
   mob_version: "~> 0.6",
   plugin_spec_version: 1,
   description:
-    "Photo/video library picker + MediaStore enumeration — extracted from mob core in Wave 2",
+    "Photo/video library picker, MediaStore/PHAsset enumeration and image thumbnails with EXIF metadata — extracted from mob core in Wave 2",
   nifs: [
     # iOS: Objective-C NIF — PHPickerViewController (iOS 14+) + the :media
     # permission flow (PHPhotoLibrary). lang: :objc -> compiled as ObjC
@@ -16,9 +16,11 @@
   ],
   # Runtime-permission capability OWNED by this plugin: :media. The picker
   # (pick/2) runs out of process and needs no permission, but library
-  # ENUMERATION (list_media/2) reads the whole MediaStore / Photos library and
-  # genuinely requires READ_MEDIA_IMAGES / READ_MEDIA_VIDEO (Android 33+) or a
-  # PHPhotoLibrary authorization (iOS). `Mob.Permissions.request(socket, :media)`
+  # ENUMERATION (list_media/2) and thumbnails of library items (thumbnail/2 on
+  # a content:// URI or ph:// id) read the MediaStore / Photos library and
+  # genuinely require READ_MEDIA_IMAGES / READ_MEDIA_VIDEO (Android 33+, plus
+  # ACCESS_MEDIA_LOCATION for un-redacted EXIF GPS) or a PHPhotoLibrary
+  # authorization (iOS). `Mob.Permissions.request(socket, :media)`
   # pops that dialog. Registered exactly like mob_camera's :camera —
   #   * iOS:     handler self-registered at NIF load
   #              (mob_photos_request_permission -> PHPhotoLibrary
@@ -45,21 +47,28 @@
     # plugin permission entries are plain strings today, so that attribute is
     # lost in the merge — harmless (the permission is a no-op on 33+) but worth
     # restoring if the manifest schema grows attribute support.
+    # ACCESS_MEDIA_LOCATION (API 29+): without it MediaStore redacts EXIF GPS
+    # from every stream the app opens, so thumbnail/2 could never report a
+    # location. MobPhotosBridge.permissionsFor("media") requests it alongside
+    # READ_MEDIA_*; it has no dialog of its own.
     permissions: [
       "android.permission.READ_MEDIA_IMAGES",
       "android.permission.READ_MEDIA_VIDEO",
-      "android.permission.READ_EXTERNAL_STORAGE"
+      "android.permission.READ_EXTERNAL_STORAGE",
+      "android.permission.ACCESS_MEDIA_LOCATION"
     ]
   },
   # PHPickerViewController / PHPickerConfiguration / PHPickerResult all live
-  # in PhotosUI; PHPhotoLibrary (permission + enumeration) lives in Photos.
-  # UIKit/Foundation are implicit. plist_keys: NSPhotoLibraryUsageDescription
+  # in PhotosUI; PHPhotoLibrary / PHAsset / PHImageManager (permission,
+  # enumeration, ph:// thumbnails) live in Photos. ImageIO decodes + writes
+  # thumbnails and reads EXIF/GPS; UniformTypeIdentifiers maps UTIs to MIME
+  # types. UIKit/Foundation are implicit. plist_keys: NSPhotoLibraryUsageDescription
   # is required by iOS the moment PHPhotoLibrary authorization is requested
   # (the :media permission flow) — without it the dialog is suppressed. The
   # string is a placeholder the host must replace (App Store review rejects
   # the default text — intentional friction, same gate as mob_camera).
   ios: %{
-    frameworks: ["PhotosUI", "Photos"],
+    frameworks: ["PhotosUI", "Photos", "ImageIO", "UniformTypeIdentifiers"],
     plist_keys: %{
       "NSPhotoLibraryUsageDescription" =>
         "Required by mob_photos to list your photo library — replace this string in your Info.plist"

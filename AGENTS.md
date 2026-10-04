@@ -1,6 +1,6 @@
 # mob_photos — Agent Instructions
 
-You're in **mob_photos**, a Mob plugin for the OS photo/video library. Two access modes: the system picker (`pick/2`) runs out of process and needs no runtime permission on either platform; library enumeration (`list_media/2`) reads MediaStore/PHPhotoLibrary directly and does need the `:media` permission.
+You're in **mob_photos**, a Mob plugin for the OS photo/video library. Three entry points: the system picker (`pick/2`) runs out of process and needs no runtime permission on either platform; library enumeration (`list_media/2`) reads MediaStore/PHPhotoLibrary directly and does need the `:media` permission; `thumbnail/2` synchronously writes a downscaled upright JPEG of one image and returns its EXIF metadata (library sources need `:media`, files the app owns don't).
 
 **Also read [`~/code/mob/AGENTS.md`](../mob/AGENTS.md)** for the system view — mob's three-repo topology, plugin manifest schema, `Mob.Composite` / `Mob.Sigil`, how to drive a running app from your session, and the cross-cutting pre-empt-failure rules. See [`~/code/mob/MOB_PLUGINS.md`](../mob/MOB_PLUGINS.md) for the manifest schema. This file is mob_photos-specific.
 
@@ -8,15 +8,16 @@ You're in **mob_photos**, a Mob plugin for the OS photo/video library. Two acces
 
 ## What mob_photos is, in one paragraph
 
-A cross-platform plugin whose public surface is the `MobPhotos` module. `pick/2` opens the OS's own out-of-process picker (`PHPickerViewController` on iOS 14+, `PickMultipleVisualMedia` on Android) — the user chooses individual items and the app only ever sees those items, so no photo-library permission dialog is shown and no usage-description string is needed. `list_media/2` is a different beast: it enumerates the whole library with metadata for an "AI Library Search"-style screen. It queries `MediaStore` via `ContentResolver` on Android (async — a background thread inside the Kotlin bridge posts back to a NIF deliver-thunk); on iOS it currently returns `{:error, :unsupported}`. Enumeration requires the `:media` permission this plugin owns and registers with core's permission registry.
+A cross-platform plugin whose public surface is the `MobPhotos` module. `pick/2` opens the OS's own out-of-process picker (`PHPickerViewController` on iOS 14+, `PickMultipleVisualMedia` on Android) — the user chooses individual items and the app only ever sees those items, so no photo-library permission dialog is shown and no usage-description string is needed. `list_media/2` is a different beast: it enumerates the whole library with metadata for an "AI Library Search"-style screen. It queries `MediaStore` via `ContentResolver` on Android (async — a background thread inside the Kotlin bridge posts back to a NIF deliver-thunk) and `PHAsset` on iOS (async — a GCD queue sends the same `{:mob_file_result, "media", "listed", json}` envelope). `thumbnail/2` is the one synchronous call: a dirty-IO NIF (Android `BitmapFactory` + `ExifInterface`; iOS ImageIO, `PHImageManager` for `ph://` ids) returning a JSON reply that `MobPhotos.decode_thumbnail_result/1` turns into the public map. Enumeration requires the `:media` permission this plugin owns and registers with core's permission registry.
 
 Delivery message shapes (calling `Mob.Screen` receives these in `handle_info/2`):
 
 | Source            | Message                             | Item shape                                               |
 |-------------------|-------------------------------------|----------------------------------------------------------|
-| `pick/2` success  | `{:photos, :picked, items}`         | `%{path, type, width, height}` — see parity notes below  |
+| `pick/2` success  | `{:photos, :picked, items}`         | `%{path, type, name, size, width, height}` — see parity notes below |
 | `pick/2` dismiss  | `{:photos, :cancelled}`             | —                                                        |
-| `list_media/2`    | `{:media, :listed, items}`          | atom-keyed `%{uri, display_name, size, date_added, mime_type, type}` |
+| `list_media/2`    | `{:media, :listed, items}`          | atom-keyed `%{uri, display_name, size, date_added, date_taken, width, height, mime_type, type}`; `size`/`date_taken`/`width`/`height` omitted when unknown |
+| `thumbnail/2`     | return value (synchronous)          | `{:ok, %{path, width, height, orig_width, orig_height, mime, size, taken_at, latitude, longitude, altitude, make, model}}` or `{:error, :not_found \| :unsupported \| :permission \| String.t()}` |
 
 ## What mob_photos is NOT
 
@@ -26,14 +27,14 @@ Delivery message shapes (calling `Mob.Screen` receives these in `handle_info/2`)
 
 ## Anatomy of the plugin
 
-* `lib/mob_photos.ex` — `MobPhotos` public API: `pick/2`, `list_media/2`, `list_media_opts/1`. The moduledoc is canonical for delivery message shapes + platform-parity notes; keep it and this file in agreement.
-* `lib/mob_photos.ex` also exposes `list_media_opts/1` as a **pure** function so tests can pin defaults + JSON serialisation without going through the NIF. Do not fold it back into `list_media/2`.
-* `src/mob_photos_nif.erl` — Erlang NIF stub. `photos_pick/2`, `media_list/1`. `on_load` tolerates a missing native lib (host dev build) — the stubs raise `nif_not_loaded` until the real one links.
-* `priv/mob_plugin.exs` — plugin manifest. Declares the ObjC + Zig NIF pair, the `:media` permission capability (iOS handler `mob_photos_request_permission`), Android `READ_MEDIA_*` + `READ_EXTERNAL_STORAGE`, iOS `PhotosUI` + `Photos` frameworks, and the `NSPhotoLibraryUsageDescription` placeholder string.
-* `priv/native/ios/mob_photos_nif.m` — Objective-C NIF. `PHPickerViewController` + the `PHPhotoLibrary` authorization flow that backs `:media`. `media_list` is stubbed as `{:error, :unsupported}` — Android is the priority.
-* `priv/native/jni/mob_photos_nif.zig` — Zig NIF exposing `photos_pick` + `media_list` to BEAM; delivers via the generic `{:mob_file_result, "media" | "photos", sub, json}` path core decodes into atom-keyed maps.
-* `priv/native/android/MobPhotosBridge.kt` — Kotlin bridge (`io.mob.photos.MobPhotosBridge`). Implements `MobPermissionProvider` mapping `"media"` → `READ_MEDIA_IMAGES/VIDEO` (+ pre-33 `READ_EXTERNAL_STORAGE`), launches the picker, and runs the `MediaStore` query off a background `Thread {}` so the BEAM scheduler thread isn't blocked.
-* `test/mob_photos_test.exs` — pins manifest shape, NIF stub agreement, `list_media_opts/1` serialisation, and source-level assertions on the JNI zig + Kotlin bridge + iOS `.m` (JNI/ObjC can't run under `mix test`).
+* `lib/mob_photos.ex` — `MobPhotos` public API: `pick/2`, `list_media/2`, `list_media_opts/1`, `thumbnail/2`. The moduledoc is canonical for delivery message shapes + platform-parity notes; keep it and this file in agreement.
+* `lib/mob_photos.ex` also exposes `list_media_opts/1` as a **pure** function so tests can pin defaults + JSON serialisation without going through the NIF. Do not fold it back into `list_media/2`. Same for the undocumented `thumbnail_request/2` (option validation + source classification) and `decode_thumbnail_result/1` (native JSON reply → public map, incl. `taken_at` precedence and the (0, 0) GPS = absent rule).
+* `src/mob_photos_nif.erl` — Erlang NIF stub. `photos_pick/2`, `media_list/1`, `photo_thumbnail/1` (dirty IO). `on_load` tolerates a missing native lib (host dev build) — the stubs raise `nif_not_loaded` until the real one links.
+* `priv/mob_plugin.exs` — plugin manifest. Declares the ObjC + Zig NIF pair, the `:media` permission capability (iOS handler `mob_photos_request_permission`), Android `READ_MEDIA_*` + `READ_EXTERNAL_STORAGE` + `ACCESS_MEDIA_LOCATION`, iOS `PhotosUI` + `Photos` + `ImageIO` + `UniformTypeIdentifiers` frameworks, and the `NSPhotoLibraryUsageDescription` placeholder string.
+* `priv/native/ios/mob_photos_nif.m` — Objective-C NIF. `PHPickerViewController`, the `PHPhotoLibrary` authorization flow that backs `:media`, `PHAsset` enumeration, and the ImageIO / `PHImageManager` thumbnail path.
+* `priv/native/jni/mob_photos_nif.zig` — Zig NIF exposing `photos_pick` + `media_list` + `photo_thumbnail` (byte[] JSON in/out, dirty IO) to BEAM; delivers via the generic `{:mob_file_result, "media" | "photos", sub, json}` path core decodes into atom-keyed maps.
+* `priv/native/android/MobPhotosBridge.kt` — Kotlin bridge (`io.mob.photos.MobPhotosBridge`). Implements `MobPermissionProvider` mapping `"media"` → `READ_MEDIA_IMAGES/VIDEO` (+ pre-33 `READ_EXTERNAL_STORAGE`, + 29+ `ACCESS_MEDIA_LOCATION`), launches the picker, runs the `MediaStore` query off a background `Thread {}` so the BEAM scheduler thread isn't blocked, and implements the synchronous `photo_thumbnail` (called on a dirty scheduler thread).
+* `test/mob_photos_test.exs` — pins manifest shape, NIF stub agreement, `list_media_opts/1` serialisation, `thumbnail_request/2` / `decode_thumbnail_result/1` behaviour, and source-level assertions on the JNI zig + Kotlin bridge + iOS `.m` (JNI/ObjC can't run under `mix test`).
 * There is no `decisions/` directory here yet — if you need one for a non-obvious tradeoff, follow the mob core convention.
 
 ## Cross-repo work
@@ -58,8 +59,10 @@ The suite pins the manifest via `MobDev.Plugin.{Manifest, Validator}`, the NIF s
 ## The pre-empt-failure rules that matter here
 
 1. **The picker needs no permission — enumeration does.** Do not add a permission prompt around `pick/2` "for symmetry." It runs out of process; Apple and Google both designed it so the app can't see anything the user didn't hand it. Prompting is wrong and it teaches users to click through dialogs.
-2. **iOS and Android picker items are not the same shape.** iOS items carry `path` + `type` (type as an atom). Android items carry `path`, `type` (a **string**), `width`, `height` — and width/height are always `0` because the picker doesn't probe dimensions. This is inherited platform-parity from core; do not "normalise" it silently. Docs must show both shapes.
-3. **`list_media/2` on iOS returns `{:error, :unsupported}` today.** Android is the priority. If a screen calls it on iOS the NIF returns synchronously and no `{:media, :listed, _}` message is ever delivered — screens must not `handle_info` for it and then hang waiting.
+2. **iOS and Android picker items are not the same shape.** `type` is an atom on iOS and a **string** on Android (inherited from core; do not "normalise" it silently). Both carry `path`, `name`, `size`; images carry upright `width`/`height` read from the copy's header. Android videos report `width`/`height` `0`, iOS videos omit them. Docs must show both shapes.
+3. **Enumeration items never carry JSON `null`.** Both platforms deliver through core's generic JSON decoder, which turns `null` into the atom `:null`, so unknown `size`/`date_taken`/`width`/`height` are left out of the item instead. MediaStore `WIDTH`/`HEIGHT` are pre-rotation; the bridge swaps them by `ORIENTATION`. Android's photo picker zeroes GPS in the copies it hands out — `thumbnail/2` of a picked file has no location by design.
+
+3a. **`thumbnail/2` must stay off the normal schedulers.** It is registered `ERL_NIF_DIRTY_JOB_IO_BOUND` on both platforms; the iOS `ph://` path uses a *synchronous* `PHImageManager` request, which is only safe because it never runs on the main thread. Don't drop the dirty flag or move the call onto the main queue.
 4. **`NSPhotoLibraryUsageDescription` is a deliberate friction gate.** The plugin ships a placeholder string that Apple's App Store review rejects on purpose (same as mob_camera). Host apps must replace it in their `Info.plist`. Do not "fix" the placeholder to a plausible-looking string — that would let apps ship without thinking about it.
 5. **Enumeration must not block the BEAM scheduler.** The Kotlin `MediaStore` query runs on `Thread {}` and calls `nativeDeliverMediaListed` when done. If you touch the bridge, keep that async boundary — a large library synchronously queried on a NIF thread would freeze the scheduler. `list_media/2`'s `limit:` option defaults to `200`; `0` or negative means "no limit" and the whole result comes back in one message — warn callers off unbounded queries.
 6. **The `types:` option is currently ignored by both native sides.** `pick(socket, types: [:image])` will still show videos. Core shipped it that way and the plugin preserves the behaviour; if you wire it up, do both platforms in the same commit and update the moduledoc.
