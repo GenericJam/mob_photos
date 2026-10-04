@@ -250,15 +250,16 @@ defmodule MobPhotos do
   defp await_thumbnail(request_json, timeout) do
     caller = self()
     tag = make_ref()
-    # Grace past the native timeout so iOS's own {"error":"timeout"} wins.
-    wait = timeout + 2_000
+    # The caller gives up at `timeout` on every platform. iOS also cancels
+    # its pending request natively at the same deadline; whichever lands
+    # first, the caller sees {:error, :timeout}.
 
     {receiver, mref} =
       spawn_monitor(fn ->
         receive do
           {:mob_photos_thumbnail, json} -> send(caller, {tag, json})
         after
-          wait -> :ok
+          timeout -> :ok
         end
       end)
 
