@@ -118,8 +118,28 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
             } else {
                 listOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
             }
-        val location = if (sdk >= 29) listOf(android.Manifest.permission.ACCESS_MEDIA_LOCATION) else emptyList()
+        // Only when the host's merged manifest declares it: core grants a
+        // capability only if every listed permission is granted, so an
+        // undeclared (stripped) one would deny :media forever.
+        val location =
+            if (sdk >= 29 && declares(android.Manifest.permission.ACCESS_MEDIA_LOCATION)) {
+                listOf(android.Manifest.permission.ACCESS_MEDIA_LOCATION)
+            } else {
+                emptyList()
+            }
         return (read + location).toTypedArray()
+    }
+
+    private fun declares(permission: String): Boolean {
+        val ctx = appContext ?: activityRef?.get() ?: return true
+        return try {
+            ctx.packageManager
+                .getPackageInfo(ctx.packageName, android.content.pm.PackageManager.GET_PERMISSIONS)
+                .requestedPermissions
+                ?.contains(permission) == true
+        } catch (e: Exception) {
+            true
+        }
     }
 
     private val pickSeq = AtomicLong(0L)
@@ -355,7 +375,10 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
     // ── Thumbnail ──────────────────────────────────────────────────────────
     // Signature matches what the zig NIF calls: (J[B)V — the receiver pid and
     // a UTF-8 JSON request
-    // {"kind":"file"|"content"|"asset","source":…,"max_size":N,"quality":Q}.
+    // {"kind":"file"|"content"|"asset","source":…,"max_size":N,"quality":Q,
+    // "timeout_ms":T}. A job still queued when its timeout has passed is
+    // skipped (its caller has already given up), so abandoned requests don't
+    // hold the two workers. A decode that has started runs to completion.
     // Returns at once: the decode runs on thumbnailPool (never a BEAM
     // scheduler thread) and the UTF-8 JSON reply goes back through
     // nativeDeliverThumbnail. Never throws — every failure becomes
@@ -366,16 +389,23 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
         request: ByteArray,
     ) {
         try {
-            thumbnailPool.execute { nativeDeliverThumbnail(pid, thumbnailReply(request)) }
+            val queuedAt = System.nanoTime()
+            thumbnailPool.execute { nativeDeliverThumbnail(pid, thumbnailReply(request, queuedAt)) }
         } catch (e: java.util.concurrent.RejectedExecutionException) {
             nativeDeliverThumbnail(pid, errorReply("thumbnail worker unavailable"))
         }
     }
 
-    private fun thumbnailReply(request: ByteArray): ByteArray {
+    private fun thumbnailReply(
+        request: ByteArray,
+        queuedAt: Long,
+    ): ByteArray {
         val reply =
             try {
-                thumbnail(JSONObject(String(request, Charsets.UTF_8)))
+                val req = JSONObject(String(request, Charsets.UTF_8))
+                val waitedMs = (System.nanoTime() - queuedAt) / 1_000_000
+                if (waitedMs >= req.optLong("timeout_ms", 30_000L)) throw ThumbError("timeout")
+                thumbnail(req)
             } catch (e: ThumbError) {
                 JSONObject().put("error", e.code)
             } catch (e: FileNotFoundException) {
@@ -384,7 +414,7 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
                 JSONObject().put("error", "permission")
             } catch (e: OutOfMemoryError) {
                 JSONObject().put("error", "out of memory decoding the image")
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 JSONObject().put("error", e.message ?: e.javaClass.simpleName)
             }
         return reply.toString().toByteArray(Charsets.UTF_8)

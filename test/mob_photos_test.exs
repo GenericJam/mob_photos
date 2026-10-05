@@ -195,7 +195,9 @@ defmodule MobPhotosTest do
             [max_size: 12.5],
             [quality: 0],
             [quality: 101],
-            [quality: "80"]
+            [quality: "80"],
+            [timeout: 0],
+            [timeout: 4_294_967_296]
           ] do
         assert_raise ArgumentError, fn -> MobPhotos.thumbnail_request("/a.jpg", opts) end
       end
@@ -203,6 +205,18 @@ defmodule MobPhotosTest do
 
     test "unknown options raise (no silent typos like :max)" do
       assert_raise ArgumentError, fn -> MobPhotos.thumbnail_request("/a.jpg", max: 100) end
+    end
+
+    test "the largest VM timeout is accepted" do
+      assert {:ok, %{"timeout_ms" => 4_294_967_295}} =
+               MobPhotos.thumbnail_request("/a.jpg", timeout: 4_294_967_295)
+    end
+
+    test "a NIF that raises leaves no stray :DOWN in the caller's mailbox" do
+      # mix test has no native lib, so the stub raises nif_not_loaded.
+      assert_raise ErlangError, fn -> MobPhotos.thumbnail("/a.jpg", timeout: 50) end
+      Process.sleep(100)
+      assert {:messages, []} = Process.info(self(), :messages)
     end
 
     test "the boundary qualities 1 and 100 are accepted" do

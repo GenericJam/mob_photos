@@ -17,7 +17,7 @@ Delivery message shapes (calling `Mob.Screen` receives these in `handle_info/2`)
 | `pick/2` success  | `{:photos, :picked, items}`         | `%{path, type, name, size, width, height}` — see parity notes below |
 | `pick/2` dismiss  | `{:photos, :cancelled}`             | —                                                        |
 | `list_media/2`    | `{:media, :listed, items}`          | atom-keyed `%{uri, display_name, size, date_added, date_taken, width, height, mime_type, type}`; `size`/`date_taken`/`width`/`height` omitted when unknown |
-| `thumbnail/2`     | return value (synchronous)          | `{:ok, %{path, width, height, orig_width, orig_height, mime, size, taken_at, latitude, longitude, altitude, make, model}}` or `{:error, :not_found \| :unsupported \| :permission \| String.t()}` |
+| `thumbnail/2`     | return value (synchronous)          | `{:ok, %{path, width, height, orig_width, orig_height, mime, size, taken_at, latitude, longitude, altitude, make, model}}` or `{:error, :not_found \| :unsupported \| :permission \| :timeout \| String.t()}` |
 
 ## What mob_photos is NOT
 

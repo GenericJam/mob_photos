@@ -24,7 +24,7 @@
  *                — the same envelope the Android bridge sends; core's
  *                Mob.Screen decodes it into {media, listed, Items}.
  *
- * photo_thumbnail/2 queues the work on a GCD queue and returns ok; the JSON
+ * photo_thumbnail/2 queues the work on a two-wide operation queue and returns ok; the JSON
  * reply goes to the given receiver as {mob_photos_thumbnail, Json} (decoded by
  * MobPhotos.decode_thumbnail_result/1).
  */
@@ -349,7 +349,7 @@ static ERL_NIF_TERM nif_media_list(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     return enif_make_atom(env, "ok");
 }
 
-// ── Thumbnail (GCD worker; reply sent to the receiver) ───────────────────
+// ── Thumbnail (operation-queue worker; reply sent to the receiver) ───────
 
 static NSDictionary *pho_error(NSString *code) { return @{@"error" : code ?: @"unknown error"}; }
 
@@ -442,13 +442,15 @@ static NSDictionary *pho_thumbnail_from_source(CGImageSourceRef src, NSString *c
   if (dt && offset)
     reply[@"exif_offset"] = offset;
 
-  // An asset's PHAsset.location (set by the caller) wins over EXIF GPS.
+  // An asset's PHAsset.location (set by the caller) wins over EXIF GPS; EXIF
+  // altitude still fills in when the location had none.
   // NSJSONSerialization throws on NaN/Inf, so only finite values go in.
   NSDictionary *gps = props[(NSString *)kCGImagePropertyGPSDictionary];
   NSNumber *lat = gps[(NSString *)kCGImagePropertyGPSLatitude];
   NSNumber *lon = gps[(NSString *)kCGImagePropertyGPSLongitude];
-  if (!reply[@"latitude"] && [lat isKindOfClass:[NSNumber class]] && [lon isKindOfClass:[NSNumber class]] &&
-      isfinite(lat.doubleValue) && isfinite(lon.doubleValue)) {
+  BOOL exifPosition = [lat isKindOfClass:[NSNumber class]] && [lon isKindOfClass:[NSNumber class]] &&
+                      isfinite(lat.doubleValue) && isfinite(lon.doubleValue);
+  if (!reply[@"latitude"] && exifPosition) {
     double la = lat.doubleValue, lo = lon.doubleValue;
     if ([pho_string(gps[(NSString *)kCGImagePropertyGPSLatitudeRef]) isEqualToString:@"S"])
       la = -la;
@@ -456,13 +458,14 @@ static NSDictionary *pho_thumbnail_from_source(CGImageSourceRef src, NSString *c
       lo = -lo;
     reply[@"latitude"] = @(la);
     reply[@"longitude"] = @(lo);
-    NSNumber *alt = gps[(NSString *)kCGImagePropertyGPSAltitude];
-    if ([alt isKindOfClass:[NSNumber class]] && isfinite(alt.doubleValue)) {
-      double a = alt.doubleValue;
-      if ([gps[(NSString *)kCGImagePropertyGPSAltitudeRef] intValue] == 1)
-        a = -a;
-      reply[@"altitude"] = @(a);
-    }
+  }
+  NSNumber *alt = gps[(NSString *)kCGImagePropertyGPSAltitude];
+  if (reply[@"latitude"] && !reply[@"altitude"] && exifPosition && [alt isKindOfClass:[NSNumber class]] &&
+      isfinite(alt.doubleValue)) {
+    double a = alt.doubleValue;
+    if ([gps[(NSString *)kCGImagePropertyGPSAltitudeRef] intValue] == 1)
+      a = -a;
+    reply[@"altitude"] = @(a);
   }
 
   NSDictionary *tiff = props[(NSString *)kCGImagePropertyTIFFDictionary];
@@ -505,8 +508,9 @@ static NSDictionary *pho_thumbnail_asset(NSString *localId, NSString *cacheKey, 
 
   // The original bytes (not a rendered UIImage), so ImageIO sees the EXIF.
   // iCloud-only originals are downloaded, so the request is asynchronous
-  // (a synchronous one can't be cancelled) and bounded by the caller's
-  // timeout. This thread is a GCD worker, never main, so waiting is fine.
+  // (a synchronous one can't be cancelled) and bounded by what is left of the
+  // caller's timeout. This is an operation-queue thread, never main, so
+  // waiting is fine.
   PHImageRequestOptions *ro = [[PHImageRequestOptions alloc] init];
   ro.synchronous = NO;
   ro.networkAccessAllowed = YES;
@@ -561,7 +565,10 @@ static long pho_long(id v, long fallback) {
   return [v isKindOfClass:[NSNumber class]] ? [v longValue] : fallback;
 }
 
-static NSData *pho_thumbnail_reply(NSData *requestJson) {
+// queuedAt: CLOCK_UPTIME_RAW ns when the NIF queued the request. A job whose
+// timeout has already passed is skipped (its caller has given up), and a
+// ph:// wait gets only the time that is left.
+static NSData *pho_thumbnail_reply(NSData *requestJson, uint64_t queuedAt) {
   NSDictionary *req = [NSJSONSerialization JSONObjectWithData:requestJson options:0 error:nil];
   NSDictionary *reply;
   if (![req isKindOfClass:[NSDictionary class]]) {
@@ -572,11 +579,14 @@ static NSData *pho_thumbnail_reply(NSData *requestJson) {
     long maxSize = MAX(1L, pho_long(req[@"max_size"], 1280));
     int quality = (int)MIN(100L, MAX(1L, pho_long(req[@"quality"], 80)));
     long timeoutMs = MAX(1L, pho_long(req[@"timeout_ms"], 30000));
+    long leftMs = timeoutMs - (long)((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - queuedAt) / NSEC_PER_MSEC);
     NSString *key = [NSString stringWithFormat:@"%@\n%@\n%ld\n%d", kind, source, maxSize, quality];
-    if ([kind isEqualToString:@"file"])
+    if (leftMs <= 0)
+      reply = pho_error(@"timeout");
+    else if ([kind isEqualToString:@"file"])
       reply = pho_thumbnail_file(source, key, maxSize, quality);
     else if ([kind isEqualToString:@"asset"])
-      reply = pho_thumbnail_asset(source, key, maxSize, quality, timeoutMs);
+      reply = pho_thumbnail_asset(source, key, maxSize, quality, leftMs);
     else if ([kind isEqualToString:@"content"])
       reply = pho_error(@"content:// URIs are Android-only; on iOS pass a file path or a ph:// asset id");
     else
@@ -589,9 +599,9 @@ static NSData *pho_thumbnail_reply(NSData *requestJson) {
 }
 
 // photo_thumbnail(Receiver, RequestJson) -> ok. Only QUEUES the work: the
-// decode (and any Photos/iCloud wait) runs on a GCD queue, never on a BEAM
-// scheduler (the VM has a single dirty-IO scheduler; holding it would stall
-// every file operation). The JSON reply goes to Receiver as
+// decode (and any Photos/iCloud wait) runs on a private operation queue,
+// never on a BEAM scheduler (the VM has a single dirty-IO scheduler; holding
+// it would stall every file operation). The JSON reply goes to Receiver as
 // {mob_photos_thumbnail, Json}.
 static ERL_NIF_TERM nif_photo_thumbnail(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
@@ -602,24 +612,25 @@ static ERL_NIF_TERM nif_photo_thumbnail(ErlNifEnv *env, int argc, const ERL_NIF_
     if (!enif_inspect_binary(env, argv[1], &bin) && !enif_inspect_iolist_as_binary(env, argv[1], &bin))
         return enif_make_badarg(env);
     NSData *request = [NSData dataWithBytes:bin.data length:bin.size];
+    uint64_t queuedAt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     // At most two full-size decodes at once (Android uses a two-thread pool).
-    static dispatch_semaphore_t slots;
+    // Queued operations hold no thread, unlike blocking GCD workers.
+    static NSOperationQueue *queue;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-      slots = dispatch_semaphore_create(2);
+      queue = [[NSOperationQueue alloc] init];
+      queue.name = @"mob_photos.thumbnail";
+      queue.maxConcurrentOperationCount = 2;
+      queue.qualityOfService = NSQualityOfServiceUserInitiated;
     });
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-      dispatch_semaphore_wait(slots, DISPATCH_TIME_FOREVER);
-      @autoreleasepool {
-        NSData *json = pho_thumbnail_reply(request);
-        ErlNifEnv *e = enif_alloc_env();
-        ERL_NIF_TERM msg = enif_make_tuple2(e, enif_make_atom(e, "mob_photos_thumbnail"),
-                                            pho_make_binary(e, json.bytes, json.length));
-        enif_send(NULL, &pid, e, msg);
-        enif_free_env(e);
-      }
-      dispatch_semaphore_signal(slots);
-    });
+    [queue addOperationWithBlock:^{
+      NSData *json = pho_thumbnail_reply(request, queuedAt);
+      ErlNifEnv *e = enif_alloc_env();
+      ERL_NIF_TERM msg = enif_make_tuple2(e, enif_make_atom(e, "mob_photos_thumbnail"),
+                                          pho_make_binary(e, json.bytes, json.length));
+      enif_send(NULL, &pid, e, msg);
+      enif_free_env(e);
+    }];
     return enif_make_atom(env, "ok");
 }
 

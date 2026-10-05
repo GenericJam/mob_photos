@@ -181,7 +181,7 @@ defmodule MobPhotos do
   Write a downscaled, upright JPEG of an image and return it with the image's
   metadata. **Synchronous**: the caller waits (typically tens to a few hundred
   ms; longer if iOS must download an iCloud original). The decode itself runs
-  on a native thread (a GCD queue on iOS, a small worker pool on Android),
+  on a native thread (a two-wide operation queue on iOS, a two-thread pool on Android),
   never on a BEAM scheduler, so a slow image doesn't hold up other processes
   or the VM's file I/O; only the calling process waits.
 
@@ -203,9 +203,11 @@ defmodule MobPhotos do
     - `quality:` JPEG quality `1..100` (default `80`), handed to the platform
       encoder (Android `Bitmap.compress`, iOS ImageIO as `quality / 100`), so
       the same value gives somewhat different file sizes per platform
-    - `timeout:` milliseconds to wait (default `30_000`). iOS cancels a pending
-      iCloud download at this point; on Android a decode that overruns
-      finishes in the background and its result is dropped.
+    - `timeout:` milliseconds to wait, `1..4_294_967_295` (default `30_000`).
+      The caller gets `{:error, :timeout}` at that point and never sees a late
+      reply. A request still queued natively at its deadline is skipped; iOS
+      also cancels a running iCloud download. On Android a decode that has
+      already started finishes in the background and its result is dropped.
 
   On success returns `{:ok, info}` (see `t:thumbnail_info/0`):
 
@@ -263,7 +265,7 @@ defmodule MobPhotos do
         end
       end)
 
-    case :mob_photos_nif.photo_thumbnail(receiver, request_json) do
+    case call_thumbnail_nif(receiver, mref, request_json) do
       :ok ->
         receive do
           {^tag, json} ->
@@ -281,7 +283,20 @@ defmodule MobPhotos do
     end
   end
 
+  # A NIF that raises (not loaded, badarg) must not leave the monitored
+  # receiver behind to deliver a stray :DOWN into the caller's mailbox.
+  defp call_thumbnail_nif(receiver, mref, request_json) do
+    :mob_photos_nif.photo_thumbnail(receiver, request_json)
+  rescue
+    e ->
+      Process.exit(receiver, :kill)
+      Process.demonitor(mref, [:flush])
+      reraise e, __STACKTRACE__
+  end
+
   @max_max_size 16_384
+  # The largest `after` timeout the VM accepts.
+  @max_timeout 4_294_967_295
 
   @doc false
   # The JSON request handed to the photo_thumbnail NIF. Public (but
@@ -309,8 +324,9 @@ defmodule MobPhotos do
       raise ArgumentError, "quality must be an integer in 1..100, got: #{inspect(quality)}"
     end
 
-    unless is_integer(timeout) and timeout > 0 do
-      raise ArgumentError, "timeout must be a positive integer (ms), got: #{inspect(timeout)}"
+    unless is_integer(timeout) and timeout in 1..@max_timeout do
+      raise ArgumentError,
+            "timeout must be an integer in 1..#{@max_timeout} (ms), got: #{inspect(timeout)}"
     end
 
     with {:ok, kind, target} <- classify_source(source) do

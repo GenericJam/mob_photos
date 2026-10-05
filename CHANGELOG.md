@@ -15,10 +15,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
   `DateTimeOriginal` + offset, else the platform capture date),
   `latitude`/`longitude`/`altitude`, `make`/`model`. Takes an absolute path,
   an Android `content://` URI or an iOS `ph://<localIdentifier>`. Synchronous
-  for the caller, but the decode runs on native worker threads (a GCD queue,
-  a two-thread pool on Android), never on a BEAM scheduler. Options
-  `max_size:` (default 1280), `quality:` (default 80), `timeout:` (default
-  30 s; iOS cancels a pending iCloud download).
+  for the caller, but the decode runs on native worker threads (a two-wide
+  operation queue on iOS, a two-thread pool on Android), never on a BEAM
+  scheduler. Options `max_size:` (default 1280), `quality:` (default 80),
+  `timeout:` (default 30 s; iOS cancels a pending iCloud download, and a
+  request still queued at its deadline is skipped on both platforms).
   Android: `BitmapFactory` subsampling + `ExifInterface`, un-redacted GPS via
   `MediaStore.setRequireOriginal`. iOS: ImageIO thumbnails + EXIF/GPS,
   `PHImageManager` + `PHAsset.location`/`creationDate` for `ph://` ids.
