@@ -24,9 +24,9 @@
  *                — the same envelope the Android bridge sends; core's
  *                Mob.Screen decodes it into {media, listed, Items}.
  *
- * photo_thumbnail/2 queues the work on a two-wide operation queue and returns ok; the JSON
- * reply goes to the given receiver as {mob_photos_thumbnail, Json} (decoded by
- * MobPhotos.decode_thumbnail_result/1).
+ * photo_thumbnail/2 queues the work on a two-wide operation queue and returns
+ * ok; the JSON reply goes to the given receiver as {mob_photos_thumbnail, Json}
+ * (decoded by MobPhotos.decode_thumbnail_result/1).
  */
 #import <Foundation/Foundation.h>
 #import <ImageIO/ImageIO.h>

@@ -181,9 +181,9 @@ defmodule MobPhotos do
   Write a downscaled, upright JPEG of an image and return it with the image's
   metadata. **Synchronous**: the caller waits (typically tens to a few hundred
   ms; longer if iOS must download an iCloud original). The decode itself runs
-  on a native thread (a two-wide operation queue on iOS, a two-thread pool on Android),
-  never on a BEAM scheduler, so a slow image doesn't hold up other processes
-  or the VM's file I/O; only the calling process waits.
+  on a native thread (a two-wide operation queue on iOS, a two-thread pool on
+  Android), never on a BEAM scheduler, so a slow image doesn't hold up other
+  processes or the VM's file I/O; only the calling process waits.
 
   `source` is one of:
 
@@ -252,10 +252,10 @@ defmodule MobPhotos do
   defp await_thumbnail(request_json, timeout) do
     caller = self()
     tag = make_ref()
+
     # The caller gives up at `timeout` on every platform. iOS also cancels
     # its pending request natively at the same deadline; whichever lands
     # first, the caller sees {:error, :timeout}.
-
     {receiver, mref} =
       spawn_monitor(fn ->
         receive do
