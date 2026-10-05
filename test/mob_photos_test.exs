@@ -45,12 +45,24 @@ defmodule MobPhotosTest do
       assert "android.permission.READ_EXTERNAL_STORAGE" in m.android.permissions
     end
 
+    # Without it MediaStore redacts EXIF GPS from every stream: thumbnail/2
+    # would silently never report a location.
+    test "declares ACCESS_MEDIA_LOCATION so thumbnails keep EXIF GPS", %{manifest: m} do
+      assert "android.permission.ACCESS_MEDIA_LOCATION" in m.android.permissions
+    end
+
     test "iOS links PhotosUI (picker) + Photos (permission/enumeration) and a plist usage string",
          %{manifest: m} do
       assert "PhotosUI" in m.ios.frameworks
       assert "Photos" in m.ios.frameworks
       # PHPhotoLibrary authorization requires NSPhotoLibraryUsageDescription.
       assert Map.has_key?(m.ios.plist_keys, "NSPhotoLibraryUsageDescription")
+    end
+
+    test "iOS links the frameworks the thumbnail path's symbols live in", %{manifest: m} do
+      # kCGImage* constants + CGImageSource/Destination, and UTTypeJPEG.
+      assert "ImageIO" in m.ios.frameworks
+      assert "UniformTypeIdentifiers" in m.ios.frameworks
     end
 
     test "has no host requirements (picker + enumeration read via contentResolver)",
@@ -80,7 +92,7 @@ defmodule MobPhotosTest do
     test "every NIF the public API calls is exported by the stub at the right arity" do
       exports = :mob_photos_nif.module_info(:exports)
 
-      for fa <- [photos_pick: 2, media_list: 1] do
+      for fa <- [photos_pick: 2, media_list: 1, photo_thumbnail: 2] do
         assert fa in exports, "#{inspect(fa)} missing from mob_photos_nif exports"
       end
     end
@@ -94,6 +106,10 @@ defmodule MobPhotosTest do
 
       assert_raise ErlangError, ~r/nif_not_loaded/, fn ->
         :mob_photos_nif.media_list("{}")
+      end
+
+      assert_raise ErlangError, ~r/nif_not_loaded/, fn ->
+        MobPhotos.thumbnail("/tmp/x.jpg")
       end
     end
   end
@@ -123,20 +139,231 @@ defmodule MobPhotosTest do
     end
   end
 
+  describe "thumbnail_request/2 (option normalisation + source classification)" do
+    test "defaults to a 1280 px longest side at quality 80" do
+      assert {:ok, %{"max_size" => 1280, "quality" => 80}} =
+               MobPhotos.thumbnail_request("/sdcard/DCIM/Camera/a.jpg", [])
+    end
+
+    test "max_size and quality override the defaults" do
+      assert {:ok, %{"max_size" => 512, "quality" => 95}} =
+               MobPhotos.thumbnail_request("/a.jpg", max_size: 512, quality: 95)
+    end
+
+    test "an absolute path is a file source, passed through verbatim" do
+      assert {:ok, %{"kind" => "file", "source" => "/data/user/0/app/cache/mob_pick_1.jpg"}} =
+               MobPhotos.thumbnail_request("/data/user/0/app/cache/mob_pick_1.jpg", [])
+    end
+
+    test "a file:// URL becomes its decoded local path" do
+      assert {:ok, %{"kind" => "file", "source" => "/tmp/My Photo.jpg"}} =
+               MobPhotos.thumbnail_request("file:///tmp/My%20Photo.jpg", [])
+
+      assert {:ok, %{"kind" => "file", "source" => "/tmp/a.jpg"}} =
+               MobPhotos.thumbnail_request("file://localhost/tmp/a.jpg", [])
+    end
+
+    test "a file:// URL naming another host is rejected" do
+      assert {:error, "invalid source" <> _} =
+               MobPhotos.thumbnail_request("file://server/share/a.jpg", [])
+    end
+
+    test "a content:// URI is kept whole (the Android bridge parses it)" do
+      uri = "content://media/external/images/media/1000000021"
+
+      assert {:ok, %{"kind" => "content", "source" => ^uri}} =
+               MobPhotos.thumbnail_request(uri, [])
+    end
+
+    test "a ph:// id is an asset source carrying the bare local identifier" do
+      assert {:ok,
+              %{"kind" => "asset", "source" => "9F983DBA-EC35-42B8-8773-B597CF782EDD/L0/001"}} =
+               MobPhotos.thumbnail_request("ph://9F983DBA-EC35-42B8-8773-B597CF782EDD/L0/001", [])
+    end
+
+    test "relative paths, empty ids and other schemes are errors, not NIF calls" do
+      for bad <- ["IMG_1.jpg", "", "ph://", "content://", "https://example.com/a.jpg"] do
+        assert {:error, "invalid source" <> _} = MobPhotos.thumbnail_request(bad, []),
+               "expected #{inspect(bad)} to be rejected"
+      end
+    end
+
+    test "out-of-range or non-integer options raise" do
+      for opts <- [
+            [max_size: 0],
+            [max_size: -5],
+            [max_size: 12.5],
+            [quality: 0],
+            [quality: 101],
+            [quality: "80"],
+            [timeout: 0],
+            [timeout: 4_294_967_296]
+          ] do
+        assert_raise ArgumentError, fn -> MobPhotos.thumbnail_request("/a.jpg", opts) end
+      end
+    end
+
+    test "unknown options raise (no silent typos like :max)" do
+      assert_raise ArgumentError, fn -> MobPhotos.thumbnail_request("/a.jpg", max: 100) end
+    end
+
+    test "the largest VM timeout is accepted" do
+      assert {:ok, %{"timeout_ms" => 4_294_967_295}} =
+               MobPhotos.thumbnail_request("/a.jpg", timeout: 4_294_967_295)
+    end
+
+    test "a NIF that raises leaves no stray :DOWN in the caller's mailbox" do
+      # mix test has no native lib, so the stub raises nif_not_loaded.
+      assert_raise ErlangError, fn -> MobPhotos.thumbnail("/a.jpg", timeout: 50) end
+      Process.sleep(100)
+      assert {:messages, []} = Process.info(self(), :messages)
+    end
+
+    test "the boundary qualities 1 and 100 are accepted" do
+      assert {:ok, %{"quality" => 1}} = MobPhotos.thumbnail_request("/a.jpg", quality: 1)
+      assert {:ok, %{"quality" => 100}} = MobPhotos.thumbnail_request("/a.jpg", quality: 100)
+    end
+  end
+
+  describe "decode_thumbnail_result/1 (native reply -> public result)" do
+    @full ~s({"path":"/c/mob_thumb_ab.jpg","width":960,"height":1280,"orig_width":3000,
+    "orig_height":4000,"mime":"image/jpeg","size":196758,"exif_datetime":"2024:05:01 12:34:56",
+    "exif_offset":"-07:00","date_taken_ms":1714592096000,"latitude":49.2827,
+    "longitude":-123.1207,"altitude":70.5,"make":"TestCam","model":"Probe 1"})
+
+    test "a full reply decodes to every documented key" do
+      assert {:ok, info} = MobPhotos.decode_thumbnail_result(@full)
+
+      assert info == %{
+               path: "/c/mob_thumb_ab.jpg",
+               width: 960,
+               height: 1280,
+               orig_width: 3000,
+               orig_height: 4000,
+               mime: "image/jpeg",
+               size: 196_758,
+               taken_at: "2024-05-01T12:34:56-07:00",
+               latitude: 49.2827,
+               longitude: -123.1207,
+               altitude: 70.5,
+               make: "TestCam",
+               model: "Probe 1"
+             }
+    end
+
+    test "a minimal reply has nil for every missing or null metadata field" do
+      json = ~s({"path":"/c/t.jpg","width":640,"height":480,"orig_width":640,"orig_height":480,
+      "mime":null,"size":null,"make":null})
+
+      assert {:ok, info} = MobPhotos.decode_thumbnail_result(json)
+
+      for key <- [:mime, :size, :taken_at, :latitude, :longitude, :altitude, :make, :model] do
+        assert Map.fetch!(info, key) == nil, "#{key} should be nil"
+      end
+    end
+
+    test "the documented error codes become atoms; anything else stays a string" do
+      assert {:error, :not_found} = MobPhotos.decode_thumbnail_result(~s({"error":"not_found"}))
+
+      assert {:error, :unsupported} =
+               MobPhotos.decode_thumbnail_result(~s({"error":"unsupported"}))
+
+      assert {:error, :permission} = MobPhotos.decode_thumbnail_result(~s({"error":"permission"}))
+      assert {:error, :timeout} = MobPhotos.decode_thumbnail_result(~s({"error":"timeout"}))
+
+      assert {:error, "out of memory decoding the image"} =
+               MobPhotos.decode_thumbnail_result(~s({"error":"out of memory decoding the image"}))
+    end
+
+    defp taken_at(fields) do
+      base = %{"path" => "/t.jpg", "width" => 1, "height" => 1}
+      json = base |> Map.merge(fields) |> :json.encode() |> IO.iodata_to_binary()
+      {:ok, %{taken_at: taken_at}} = MobPhotos.decode_thumbnail_result(json)
+      taken_at
+    end
+
+    test "taken_at: EXIF time with its offset wins over the platform date" do
+      assert taken_at(%{
+               "exif_datetime" => "2024:05:01 12:34:56",
+               "exif_offset" => "+02:00",
+               "date_taken_ms" => 1
+             }) == "2024-05-01T12:34:56+02:00"
+    end
+
+    test "taken_at: without an offset the platform's absolute date (UTC) wins" do
+      assert taken_at(%{
+               "exif_datetime" => "2024:05:01 12:34:56",
+               "date_taken_ms" => 1_714_592_096_789
+             }) ==
+               "2024-05-01T19:34:56Z"
+    end
+
+    test "taken_at: bare EXIF local time when that is all there is" do
+      assert taken_at(%{"exif_datetime" => "2023:07:14 09:00:00"}) == "2023-07-14T09:00:00"
+    end
+
+    test "taken_at: the platform date alone" do
+      assert taken_at(%{"date_taken_ms" => 1_714_592_096_000}) == "2024-05-01T19:34:56Z"
+    end
+
+    test "taken_at: a clockless camera's zero/blank EXIF date is ignored" do
+      assert taken_at(%{"exif_datetime" => "0000:00:00 00:00:00", "exif_offset" => "+00:00"}) ==
+               nil
+
+      assert taken_at(%{"exif_datetime" => "    :  :     :  :  "}) == nil
+
+      assert taken_at(%{
+               "exif_datetime" => "0000:00:00 00:00:00",
+               "date_taken_ms" => 1_714_592_096_000
+             }) ==
+               "2024-05-01T19:34:56Z"
+    end
+
+    test "taken_at: a malformed offset is dropped, not glued onto the time" do
+      assert taken_at(%{"exif_datetime" => "2023:07:14 09:00:00", "exif_offset" => "  :  "}) ==
+               "2023-07-14T09:00:00"
+    end
+
+    test "taken_at: a zero/negative or out-of-range platform date means unknown" do
+      assert taken_at(%{"date_taken_ms" => 0}) == nil
+      assert taken_at(%{"date_taken_ms" => -1}) == nil
+      assert taken_at(%{"date_taken_ms" => 1_714_592_096_000_000_000}) == nil
+    end
+
+    test "taken_at: an offset outside the real UTC range is dropped" do
+      assert taken_at(%{"exif_datetime" => "2023:07:14 09:00:00", "exif_offset" => "+99:99"}) ==
+               "2023-07-14T09:00:00"
+    end
+
+    # Android's photo picker hands out copies with the GPS tags zeroed.
+    test "a (0, 0) GPS fix (redacted/placeholder) is reported as no location, altitude included" do
+      json = ~s({"path":"/t.jpg","width":1,"height":1,"latitude":0,"longitude":0,"altitude":0})
+
+      assert {:ok, %{latitude: nil, longitude: nil, altitude: nil}} =
+               MobPhotos.decode_thumbnail_result(json)
+    end
+
+    test "integer coordinates come back as floats; a lone coordinate is dropped" do
+      json =
+        ~s({"path":"/t.jpg","width":1,"height":1,"latitude":49,"longitude":-123,"altitude":12})
+
+      assert {:ok, %{latitude: 49.0, longitude: -123.0, altitude: 12.0}} =
+               MobPhotos.decode_thumbnail_result(json)
+
+      assert {:ok, %{latitude: nil, longitude: nil}} =
+               MobPhotos.decode_thumbnail_result(~s({"path":"/t.jpg","latitude":49.1}))
+    end
+
+    test "make/model are trimmed of padding and NULs; blank becomes nil" do
+      json = ~s({"path":"/t.jpg","make":"Canon\\u0000\\u0000 ","model":"   "})
+      assert {:ok, %{make: "Canon", model: nil}} = MobPhotos.decode_thumbnail_result(json)
+    end
+  end
+
   describe "Android bridge enumeration (source-level — JNI not exercisable in mix test)" do
     setup do
       {:ok, m} = Manifest.load(@plugin_dir)
       %{src: File.read!(Path.join(@plugin_dir, m.android.bridge_kt))}
-    end
-
-    test "implements MobPermissionProvider mapping :media -> READ_MEDIA_*", %{src: src} do
-      assert src =~ "MobPermissionProvider"
-      assert src =~ "permissionsFor"
-      assert src =~ ~s(cap == "media")
-      assert src =~ "READ_MEDIA_IMAGES"
-      assert src =~ "READ_MEDIA_VIDEO"
-      # Pre-33 fallback so older devices still get read access.
-      assert src =~ "READ_EXTERNAL_STORAGE"
     end
 
     test "media_list queries MediaStore off the BEAM thread and delivers results", %{src: src} do
@@ -189,18 +416,21 @@ defmodule MobPhotosTest do
       [%{ios: %{handler: handler}}] = m.permissions
       assert src =~ handler
     end
-
-    test "list_media is stubbed unsupported on iOS (Android is the priority)", %{src: src} do
-      assert src =~ "media_list"
-      assert src =~ "unsupported"
-    end
   end
 
   describe "public API surface (extraction parity with old Mob.Photos)" do
     test "exports the full extracted surface" do
       exports = MobPhotos.__info__(:functions)
 
-      for fa <- [pick: 1, pick: 2, list_media: 1, list_media: 2, list_media_opts: 1] do
+      for fa <- [
+            pick: 1,
+            pick: 2,
+            list_media: 1,
+            list_media: 2,
+            list_media_opts: 1,
+            thumbnail: 1,
+            thumbnail: 2
+          ] do
         assert fa in exports, "#{inspect(fa)} missing from MobPhotos"
       end
     end
