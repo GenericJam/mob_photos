@@ -20,8 +20,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
   a `content://media/...` row `MediaProvider` doesn't have). An ungranted
   photo library is `{:skip, :needs_user}` on a phone and a failure on a
   simulator/emulator, where the runner pre-grants `:media`. Run it with
-  `mix mob.selftest` from a host app (mob_dev 0.7.17). Requires mob 0.9.15;
-  `mob_version` in the manifest is now `~> 0.9`.
+  `mix mob.selftest` from a host app (mob_dev 0.7.17). On an iOS simulator
+  mob_dev 0.7.17 pre-grants `:media` as `media-library`, not `photos`
+  (fixed by GenericJam/mob_dev#127, in the release after 0.7.17); until then
+  grant photos with `xcrun simctl privacy` before launch. Requires mob
+  0.9.15; `mob_version` in the manifest is now `~> 0.9`.
 
 ## [0.2.0] - 2026-10-04
 
