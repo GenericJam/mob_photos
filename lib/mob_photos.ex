@@ -239,8 +239,24 @@ defmodule MobPhotos do
           {:ok, thumbnail_info()}
           | {:error, :not_found | :unsupported | :permission | :timeout | String.t()}
   def thumbnail(source, opts \\ []) when is_binary(source) do
+    with {:ok, json} <- thumbnail_reply(:mob_photos_nif, source, opts) do
+      decode_thumbnail_result(json)
+    end
+  end
+
+  @doc false
+  # The native JSON reply to a thumbnail request, through a given NIF module,
+  # before decode_thumbnail_result/1: MobPhotos.SelfTest runs the real
+  # request/reply path and reads reply fields thumbnail/2 drops (the iOS
+  # "authorization" status); its unit tests pass a stub module.
+  @spec thumbnail_reply(module(), String.t(), keyword()) ::
+          {:ok, binary()} | {:error, :timeout | String.t()}
+  def thumbnail_reply(nif, source, opts) when is_atom(nif) and is_binary(source) do
     with {:ok, request} <- thumbnail_request(source, opts) do
-      request |> :json.encode() |> IO.iodata_to_binary() |> await_thumbnail(request["timeout_ms"])
+      request
+      |> :json.encode()
+      |> IO.iodata_to_binary()
+      |> await_thumbnail(request["timeout_ms"], nif)
     end
   end
 
@@ -249,7 +265,7 @@ defmodule MobPhotos do
   # It is addressed to a throwaway receiver, not the caller, so a reply that
   # lands after the timeout dies with the receiver instead of turning up in
   # the caller's mailbox (a Mob.Screen would hand it to handle_info).
-  defp await_thumbnail(request_json, timeout) do
+  defp await_thumbnail(request_json, timeout, nif) do
     caller = self()
     tag = make_ref()
 
@@ -265,12 +281,12 @@ defmodule MobPhotos do
         end
       end)
 
-    case call_thumbnail_nif(receiver, mref, request_json) do
+    case call_thumbnail_nif(nif, receiver, mref, request_json) do
       :ok ->
         receive do
           {^tag, json} ->
             Process.demonitor(mref, [:flush])
-            decode_thumbnail_result(json)
+            {:ok, json}
 
           {:DOWN, ^mref, :process, _pid, _reason} ->
             {:error, :timeout}
@@ -279,14 +295,19 @@ defmodule MobPhotos do
       json when is_binary(json) ->
         Process.exit(receiver, :kill)
         Process.demonitor(mref, [:flush])
-        decode_thumbnail_result(json)
+        {:ok, json}
+
+      other ->
+        Process.exit(receiver, :kill)
+        Process.demonitor(mref, [:flush])
+        {:error, "photo_thumbnail/2 returned #{inspect(other)}, expected :ok or a JSON reply"}
     end
   end
 
   # A NIF that raises (not loaded, badarg) must not leave the monitored
   # receiver behind to deliver a stray :DOWN into the caller's mailbox.
-  defp call_thumbnail_nif(receiver, mref, request_json) do
-    :mob_photos_nif.photo_thumbnail(receiver, request_json)
+  defp call_thumbnail_nif(nif, receiver, mref, request_json) do
+    nif.photo_thumbnail(receiver, request_json)
   rescue
     e ->
       Process.exit(receiver, :kill)
