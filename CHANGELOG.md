@@ -22,9 +22,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
   simulator/emulator, where the runner pre-grants `:media`. Run it with
   `mix mob.selftest` from a host app (mob_dev 0.7.17). On an iOS simulator
   mob_dev 0.7.17 pre-grants `:media` as `media-library`, not `photos`
-  (fixed by GenericJam/mob_dev#127, in the release after 0.7.17); until then
-  grant photos with `xcrun simctl privacy` before launch. Requires mob
-  0.9.15; `mob_version` in the manifest is now `~> 0.9`.
+  (fixed by GenericJam/mob_dev#127, in the release after 0.7.17). On iOS
+  26.x simulator runtimes even `simctl privacy grant photos` writes a
+  version-1 TCC row that PhotoKit ignores; see the README for the
+  workaround. Requires mob 0.9.15; `mob_version` in the manifest is now
+  `~> 0.9`.
 
 ## [0.2.0] - 2026-10-04
 
