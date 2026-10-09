@@ -6,6 +6,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
+## [Unreleased]
+
+### Added
+- **On-device self-test** (MOB-418). `MobPhotos.SelfTest` implements
+  `Mob.Plugin.SelfTest` and is declared in the manifest as `selftest:`. No
+  picker, no prompt, nothing written: it asks `photo_thumbnail/2` for two
+  images that don't exist. A missing file must answer `:not_found` (iOS:
+  the operation queue + `NSFileManager`; Android: the bridge registered,
+  has a Context, its worker opened the path and `nativeDeliverThumbnail`
+  replied). A missing library item must answer `:not_found` too (iOS: a
+  `ph://` id after `PHPhotoLibrary` authorization reads as granted; Android:
+  a `content://media/...` row `MediaProvider` doesn't have). An ungranted
+  photo library is `{:skip, :needs_user}` on a phone and a failure on a
+  simulator/emulator, where the runner pre-grants `:media`. Run it with
+  `mix mob.selftest` from a host app (mob_dev 0.7.17). Requires mob 0.9.15;
+  `mob_version` in the manifest is now `~> 0.9`.
+
 ## [0.2.0] - 2026-10-04
 
 ### Added

@@ -96,6 +96,12 @@ decoded on a native worker thread (never a BEAM scheduler). Errors:
   it.
 - `thumbnail/2` handles images only; videos return `{:error, :unsupported}`.
 
+## Self-test
+
+`MobPhotos.SelfTest` proves on a device that the native side is linked and
+answering (no picker, no prompt): run `mix mob.selftest` from a host app that
+depends on mob_photos (mob_dev >= 0.7.17).
+
 ## Development
 
 Clone, then run once:

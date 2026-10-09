@@ -1,9 +1,12 @@
 %{
   name: :mob_photos,
-  mob_version: "~> 0.6",
+  mob_version: "~> 0.9",
   plugin_spec_version: 1,
   description:
     "Photo/video library picker, MediaStore/PHAsset enumeration and image thumbnails with EXIF metadata — extracted from mob core in Wave 2",
+  # On-device proof for `mix mob.selftest` / mob_ci: photo_thumbnail/2 of a
+  # missing file and a missing library item, both answered :not_found natively.
+  selftest: MobPhotos.SelfTest,
   nifs: [
     # iOS: Objective-C NIF — PHPickerViewController (iOS 14+) + the :media
     # permission flow (PHPhotoLibrary). lang: :objc -> compiled as ObjC
