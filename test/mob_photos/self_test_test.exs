@@ -35,7 +35,7 @@ defmodule MobPhotos.SelfTestTest do
     def photo_thumbnail(receiver, request) do
       Reply.send_for(receiver, request, %{
         "file" => ~s({"error":"not_found"}),
-        "asset" => ~s({"error":"permission"}),
+        "asset" => ~s({"error":"permission","authorization":"denied"}),
         "content" => ~s({"error":"permission"})
       })
     end
@@ -104,19 +104,31 @@ defmodule MobPhotos.SelfTestTest do
     end
   end
 
-  test "library access denied: a phone's user must grant :media, a pre-granted sim/emulator fails" do
+  test "library not authorized on a phone: the user must grant :media" do
     assert run!(%{platform: :ios, device: :physical}, LibraryDeniedNif) == {:skip, :needs_user}
 
     assert run!(%{platform: :android, device: :physical}, LibraryDeniedNif) ==
              {:skip, :needs_user}
+  end
 
-    assert {:fail, ios} = run!(%{platform: :ios, device: :simulator}, LibraryDeniedNif)
-    assert ios =~ "ph://mob_photos-selftest-no-such-asset"
-    assert ios =~ "PHPhotoLibrary is not authorized"
+  test "library not authorized on a simulator/emulator: a skip that names the native status" do
+    sim = %{platform: :ios, device: :simulator}
 
-    assert {:fail, android} = run!(%{platform: :android, device: :emulator}, LibraryDeniedNif)
+    for status <- ["not_determined", "denied", "restricted"] do
+      answer = ~s({"error":"permission","authorization":"#{status}"})
+      assert {:skip, reason} = run_with(LibraryAnswerNif, sim, :library_answer, answer)
+      assert reason =~ "ph://mob_photos-selftest-no-such-asset"
+      assert reason =~ "PHPhotoLibrary read-write authorization is #{status} on this simulator"
+      assert reason =~ "ignores on iOS 26.x"
+    end
+
+    # An older iOS NIF without the status field.
+    assert {:skip, older} = run_with(LibraryAnswerNif, sim, :library_answer, @permission)
+    assert older =~ "authorization is not granted"
+
+    assert {:skip, android} = run!(%{platform: :android, device: :emulator}, LibraryDeniedNif)
     assert android =~ "content://media/external/images/media/"
-    assert android =~ "pm grant"
+    assert android =~ "MediaStore refused the read on this emulator"
   end
 
   test "the stub's nif_not_loaded fails, naming the NIF" do

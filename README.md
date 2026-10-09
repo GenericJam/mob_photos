@@ -100,17 +100,17 @@ decoded on a native worker thread (never a BEAM scheduler). Errors:
 
 `MobPhotos.SelfTest` proves on a device that the native side is linked and
 answering (no picker, no prompt): run `mix mob.selftest` from a host app that
-depends on mob_photos (mob_dev >= 0.7.17). On an iOS simulator the photo
-library must be granted. mob_dev 0.7.17 pre-grants `:media` as the wrong
-`simctl` service; GenericJam/mob_dev#127 fixes that in the release after
-0.7.17. Until then, run `xcrun simctl privacy <udid> grant photos
-<bundle id>` before launching the app. That grant works on iOS 27 simulator
-runtimes. On iOS 26.x runtimes it writes a version-1 TCC row that PhotoKit
-ignores, so the library still reads as not determined. There, set
-`auth_version=2` on the `kTCCServicePhotos` row in
-`<sim>/data/Library/TCC/TCC.db` and restart `tccd`
-(`xcrun simctl spawn <udid> launchctl kickstart -k system/com.apple.tccd`)
-or reboot the simulator.
+depends on mob_photos (mob_dev >= 0.7.17). Its library leg needs the photo
+library granted. Without the grant it skips: `{:skip, :needs_user}` on a
+phone, or a skip that names the iOS authorization status on a simulator.
+For iOS simulators:
+
+- iOS 27 runtimes: `simctl privacy grant photos` works. mob_dev pre-grants
+  it from the release after 0.7.17 (GenericJam/mob_dev#127; 0.7.17 grants
+  the wrong service). On 0.7.17, run `xcrun simctl privacy <udid> grant
+  photos <bundle id>` before launching the app.
+- iOS 26.x runtimes: PhotoKit ignores that grant (the TCC row it writes is
+  version 1), so the library leg reports `not_determined` and skips.
 
 ## Development
 

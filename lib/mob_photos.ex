@@ -238,15 +238,20 @@ defmodule MobPhotos do
   @spec thumbnail(String.t(), keyword()) ::
           {:ok, thumbnail_info()}
           | {:error, :not_found | :unsupported | :permission | :timeout | String.t()}
-  def thumbnail(source, opts \\ []) when is_binary(source),
-    do: thumbnail_via(:mob_photos_nif, source, opts)
+  def thumbnail(source, opts \\ []) when is_binary(source) do
+    with {:ok, json} <- thumbnail_reply(:mob_photos_nif, source, opts) do
+      decode_thumbnail_result(json)
+    end
+  end
 
   @doc false
-  # thumbnail/2 through a given NIF module: MobPhotos.SelfTest runs the real
-  # request/reply path, and its unit tests pass a stub module.
-  @spec thumbnail_via(module(), String.t(), keyword()) ::
-          {:ok, thumbnail_info()} | {:error, atom() | String.t()}
-  def thumbnail_via(nif, source, opts) when is_atom(nif) and is_binary(source) do
+  # The native JSON reply to a thumbnail request, through a given NIF module,
+  # before decode_thumbnail_result/1: MobPhotos.SelfTest runs the real
+  # request/reply path and reads reply fields thumbnail/2 drops (the iOS
+  # "authorization" status); its unit tests pass a stub module.
+  @spec thumbnail_reply(module(), String.t(), keyword()) ::
+          {:ok, binary()} | {:error, :timeout | String.t()}
+  def thumbnail_reply(nif, source, opts) when is_atom(nif) and is_binary(source) do
     with {:ok, request} <- thumbnail_request(source, opts) do
       request
       |> :json.encode()
@@ -281,7 +286,7 @@ defmodule MobPhotos do
         receive do
           {^tag, json} ->
             Process.demonitor(mref, [:flush])
-            decode_thumbnail_result(json)
+            {:ok, json}
 
           {:DOWN, ^mref, :process, _pid, _reason} ->
             {:error, :timeout}
@@ -290,7 +295,7 @@ defmodule MobPhotos do
       json when is_binary(json) ->
         Process.exit(receiver, :kill)
         Process.demonitor(mref, [:flush])
-        decode_thumbnail_result(json)
+        {:ok, json}
 
       other ->
         Process.exit(receiver, :kill)

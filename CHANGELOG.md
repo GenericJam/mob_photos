@@ -17,16 +17,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
   has a Context, its worker opened the path and `nativeDeliverThumbnail`
   replied). A missing library item must answer `:not_found` too (iOS: a
   `ph://` id after `PHPhotoLibrary` authorization reads as granted; Android:
-  a `content://media/...` row `MediaProvider` doesn't have). An ungranted
-  photo library is `{:skip, :needs_user}` on a phone and a failure on a
-  simulator/emulator, where the runner pre-grants `:media`. Run it with
-  `mix mob.selftest` from a host app (mob_dev 0.7.17). On an iOS simulator
-  mob_dev 0.7.17 pre-grants `:media` as `media-library`, not `photos`
-  (fixed by GenericJam/mob_dev#127, in the release after 0.7.17). On iOS
-  26.x simulator runtimes even `simctl privacy grant photos` writes a
-  version-1 TCC row that PhotoKit ignores; see the README for the
-  workaround. Requires mob 0.9.15; `mob_version` in the manifest is now
-  `~> 0.9`.
+  a `content://media/...` row `MediaProvider` doesn't have). If the photo
+  library isn't authorized, the result is `{:skip, :needs_user}` on a phone
+  and a skip whose reason names the iOS status (`not_determined`, `denied`,
+  `restricted`) on a simulator/emulator: step 1 already proved the plugin,
+  so an ungranted library says nothing about it. Run it with
+  `mix mob.selftest` from a host app (mob_dev 0.7.17). The iOS simulator
+  pre-grant works from iOS 27 runtimes with a mob_dev that has
+  GenericJam/mob_dev#127 (0.7.17 grants `:media` as `media-library`). On
+  iOS 26.x runtimes PhotoKit ignores `simctl privacy grant photos` (the TCC
+  row it writes is version 1), so the library leg skips there. Requires mob
+  0.9.15; `mob_version` in the manifest is now `~> 0.9`.
+- **iOS: `thumbnail/2`'s permission reply names the authorization
+  status.** A `ph://` request refused because the library isn't authorized
+  now replies `{"error":"permission","authorization":"not_determined" |
+  "denied" | "restricted"}`. `thumbnail/2` still returns
+  `{:error, :permission}`; the self-test reports the status.
 
 ## [0.2.0] - 2026-10-04
 

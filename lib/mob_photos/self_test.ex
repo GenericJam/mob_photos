@@ -26,22 +26,26 @@ defmodule MobPhotos.SelfTest do
        `PHPhotoLibrary authorizationStatusForAccessLevel:` (a status read,
        never a prompt) is authorized or limited and `PHAsset` found no such
        local identifier. When the library is not authorized the answer is
-       `{:error, :permission}`: on a physical device that is
-       `{:skip, :needs_user}` (someone has to grant `:media`); on a simulator
-       the runner pre-grants the manifest's `:media` capability
-       (`xcrun simctl privacy grant photos`), so it is a failure. Android
+       `{:error, :permission}` plus the status (`not_determined`, `denied`,
+       `restricted`). That is a skip, not a verdict on the plugin, since
+       step 1 already proved it: `{:skip, :needs_user}` on a physical device
+       (someone has to grant `:media`), `{:skip, "… is not_determined …"}`
+       on a simulator. The runner pre-grants `:media` there with `xcrun
+       simctl privacy grant photos`, which PhotoKit honours on iOS 27
+       runtimes and ignores on iOS 26.x (the row it writes is version 1).
+       Android
        (`content://media/external/images/media/9223372036854775807`):
        `MediaProvider` looks the row up under its own identity before it
        checks the caller and throws `FileNotFoundException("No item at …")`,
        so the answer is `:not_found` with or without `READ_MEDIA_*`; this leg
        proves the bridge reaches `ContentResolver` → `MediaProvider`, not the
-       grant. A `:permission` answer is still classified as on iOS (skip on a
-       phone, failure on an emulator, where `pm grant` pre-granted it).
+       grant. A `:permission` answer would be classified as on iOS.
 
-  Expected: `:pass` on an iOS simulator with photos granted, an Android
-  emulator and an Android phone; `:pass` or `{:skip, :needs_user}` on an
-  iPhone, depending on whether the user granted `:media`. The host stub's
-  `nif_not_loaded` is a failure; so is any other answer, or no answer.
+  Expected: `:pass` on an iOS 27 simulator, an Android emulator and an
+  Android phone; a string skip naming `not_determined` on an iOS 26.x
+  simulator; `:pass` or `{:skip, :needs_user}` on an iPhone, depending on
+  whether the user granted `:media`. The host stub's `nif_not_loaded` is a
+  failure; so is any other answer, or no answer.
   """
   @behaviour Mob.Plugin.SelfTest
 
@@ -69,16 +73,16 @@ defmodule MobPhotos.SelfTest do
   end
 
   defp own_file(nif, platform) do
-    case MobPhotos.thumbnail_via(nif, @missing_file, timeout: @timeout) do
-      {:error, :not_found} ->
+    case ask(nif, @missing_file) do
+      {{:error, :not_found}, _json} ->
         :ok
 
-      {:error, "mob_photos bridge not registered"} ->
+      {{:error, "mob_photos bridge not registered"}, _json} ->
         {:fail,
          "photo_thumbnail/2 answered \"mob_photos bridge not registered\": the Kotlin " <>
            "MobPhotosBridge.register() never ran (nativeRegister) or a method-ID lookup failed"}
 
-      other ->
+      {other, _json} ->
         {:fail,
          "photo_thumbnail/2 of the missing file #{@missing_file} on #{platform} answered " <>
            "#{describe(other)}, expected {:error, :not_found}"}
@@ -88,28 +92,55 @@ defmodule MobPhotos.SelfTest do
   defp library(nif, platform, device) do
     source = Map.fetch!(@missing_asset, platform)
 
-    case MobPhotos.thumbnail_via(nif, source, timeout: @timeout) do
-      {:error, :not_found} ->
+    case ask(nif, source) do
+      {{:error, :not_found}, _json} ->
         :pass
 
-      {:error, :permission} when device == :physical ->
+      {{:error, :permission}, _json} when device == :physical ->
         {:skip, :needs_user}
 
-      {:error, :permission} ->
-        {:fail,
-         "photo_thumbnail/2 of the missing library item #{source} on an #{platform} #{device} " <>
-           "answered {:error, :permission}: #{library_denied(platform)}, though the runner " <>
-           "pre-grants the manifest's :media permissions on #{device}s; expected {:error, :not_found}"}
+      {{:error, :permission}, json} ->
+        {:skip,
+         "photo_thumbnail/2 of the missing library item #{source} answered :permission: " <>
+           "#{library_status(platform, json)} on this #{device}, so the library leg could not run " <>
+           "(the NIF and its delivery already answered for the missing file). " <>
+           runner_grant(platform)}
 
-      other ->
+      {other, _json} ->
         {:fail,
          "photo_thumbnail/2 of the missing library item #{source} on #{platform} answered " <>
            "#{describe(other)}, expected {:error, :not_found}"}
     end
   end
 
-  defp library_denied(:ios), do: "PHPhotoLibrary is not authorized (simctl privacy grant photos)"
-  defp library_denied(:android), do: "MediaStore refused the read (pm grant READ_MEDIA_IMAGES)"
+  # {decoded result, raw native JSON or nil}: the raw reply carries fields
+  # thumbnail/2 drops, like the iOS "authorization" status.
+  defp ask(nif, source) do
+    case MobPhotos.thumbnail_reply(nif, source, timeout: @timeout) do
+      {:ok, json} -> {MobPhotos.decode_thumbnail_result(json), json}
+      error -> {error, nil}
+    end
+  end
+
+  defp library_status(:ios, json) do
+    case :json.decode(json) do
+      %{"authorization" => status} when is_binary(status) ->
+        "PHPhotoLibrary read-write authorization is #{status}"
+
+      _ ->
+        "PHPhotoLibrary read-write authorization is not granted"
+    end
+  end
+
+  defp library_status(:android, _json), do: "MediaStore refused the read"
+
+  defp runner_grant(:ios),
+    do:
+      "The runner pre-grants :media with `simctl privacy grant photos`, which PhotoKit " <>
+        "ignores on iOS 26.x simulator runtimes (it works from iOS 27)."
+
+  defp runner_grant(:android),
+    do: "The runner pre-grants READ_MEDIA_IMAGES with `pm grant` before launch."
 
   defp describe({:error, :timeout}),
     do:

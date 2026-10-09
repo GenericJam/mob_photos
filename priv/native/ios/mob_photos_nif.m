@@ -353,6 +353,35 @@ static ERL_NIF_TERM nif_media_list(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 
 static NSDictionary *pho_error(NSString *code) { return @{@"error" : code ?: @"unknown error"}; }
 
+// {"error":"permission","authorization":<status>}: which PHPhotoLibrary
+// read-write status refused a ph:// read. MobPhotos.thumbnail/2 still returns
+// {:error, :permission}; MobPhotos.SelfTest puts the status in its skip reason
+// (a simulator whose grant PhotoKit ignored reads "not_determined").
+static NSDictionary *pho_permission_error(void) {
+  NSString *status;
+  switch ([PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite]) {
+  case PHAuthorizationStatusNotDetermined:
+    status = @"not_determined";
+    break;
+  case PHAuthorizationStatusRestricted:
+    status = @"restricted";
+    break;
+  case PHAuthorizationStatusDenied:
+    status = @"denied";
+    break;
+  case PHAuthorizationStatusAuthorized:
+    status = @"authorized";
+    break;
+  case PHAuthorizationStatusLimited:
+    status = @"limited";
+    break;
+  default:
+    status = @"unknown";
+    break;
+  }
+  return @{@"error" : @"permission", @"authorization" : status};
+}
+
 // FNV-1a: a stable cache-file name per request, so repeats overwrite.
 static NSString *pho_request_hash(NSString *s) {
   uint64_t h = 1469598103934665603ULL;
@@ -499,7 +528,7 @@ static NSDictionary *pho_thumbnail_file(NSString *path, NSString *cacheKey, long
 static NSDictionary *pho_thumbnail_asset(NSString *localId, NSString *cacheKey, long maxSize, int quality,
                                          long timeoutMs) {
   if (!pho_library_readable())
-    return pho_error(@"permission");
+    return pho_permission_error();
   PHAsset *asset = [PHAsset fetchAssetsWithLocalIdentifiers:@[ localId ] options:nil].firstObject;
   if (!asset)
     return pho_error(@"not_found");
