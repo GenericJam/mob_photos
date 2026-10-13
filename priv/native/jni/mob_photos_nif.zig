@@ -47,11 +47,17 @@ var g_photos_cls: jni.JClass = null;
 export fn Java_io_mob_photos_MobPhotosBridge_nativeRegister(jenv: *jni.JNIEnv, cls: jni.JClass) callconv(.c) void {
     g_photos_cls = jni.newGlobalRef(jenv, cls);
     if (g_photos_cls == null) return;
+    // A failed lookup leaves NoSuchMethodError pending, which would break the
+    // next JNI call and throw out of register(); clear it so the method ID
+    // stays null and its NIF answers bridge_not_registered (MOB-424).
     g_photos.photos_pick = jni.getStaticMethodID(jenv, cls, "photos_pick", "(JLjava/lang/String;)V");
+    jni.exceptionClear(jenv);
     g_photos.media_list = jni.getStaticMethodID(jenv, cls, "media_list", "(JLjava/lang/String;)V");
+    jni.exceptionClear(jenv);
     // byte[] (not jstrings): NewStringUTF wants modified UTF-8, byte arrays
     // round-trip UTF-8 JSON verbatim (paths/names can be non-BMP).
     g_photos.photo_thumbnail = jni.getStaticMethodID(jenv, cls, "photo_thumbnail", "(J[B)V");
+    jni.exceptionClear(jenv);
 }
 
 // ── Thread-attach + pid round-trip helpers (mirror mob-core / camera) ─────

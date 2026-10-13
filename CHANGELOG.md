@@ -15,7 +15,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
   checking them, so a call before `MobPhotosBridge.register()` ran (or after
   a failed method-ID lookup) crashed the app. They now answer
   `{:error, :bridge_not_registered}`, the way `photo_thumbnail/2` already
-  answered an error reply.
+  answered an error reply. `nativeRegister` now clears the
+  `NoSuchMethodError` a failed method-ID lookup leaves pending, so that
+  method ID stays null instead of the error being thrown out of
+  `MobPhotosBridge.register()`.
 - **`MobPhotos.pick/2` and `MobPhotos.list_media/2` log a refused call.** They
   log a warning naming the function and the reason when the NIF answers
   `{:error, reason}`, instead of dropping it. They still return the socket.
