@@ -6,6 +6,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **Android: a pick or library-listing call before the bridge registers no
+  longer aborts the VM** (MOB-424). `photos_pick/2` and `media_list/1` called
+  JNI through the cached `MobPhotosBridge` class and method ID without
+  checking them, so a call before `MobPhotosBridge.register()` ran (or after
+  a failed method-ID lookup) crashed the app. They now answer
+  `{:error, :bridge_not_registered}`, the way `photo_thumbnail/2` already
+  answered an error reply.
+- **`MobPhotos.pick/2` and `MobPhotos.list_media/2` log a refused call.** They
+  log a warning naming the function and the reason when the NIF answers
+  `{:error, reason}`, instead of dropping it. They still return the socket.
+
 ## [0.2.1] - 2026-10-09
 
 ### Added

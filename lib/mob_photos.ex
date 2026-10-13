@@ -92,7 +92,17 @@ defmodule MobPhotos do
               latitude: 49.2827, longitude: -123.1207}} = MobPhotos.thumbnail(item.uri)
 
   See `thumbnail/2`.
+
+  ## When the native side refuses a call
+
+  `pick/2` and `list_media/2` keep returning the socket. When the native side
+  refuses the call (on Android, `{:error, :bridge_not_registered}` when
+  `MobPhotosBridge` never registered), they log a warning naming the function
+  and the reason, and no `{:photos, …}` / `{:media, …}` message follows.
+  `mix mob.selftest` reports an unregistered bridge before you get that far.
   """
+
+  require Logger
 
   @default_max_size 1280
   @default_quality 80
@@ -127,7 +137,7 @@ defmodule MobPhotos do
   def pick(socket, opts \\ []) do
     max = Keyword.get(opts, :max, 1)
     types = Keyword.get(opts, :types, [:image]) |> Enum.map(&Atom.to_string/1)
-    :mob_photos_nif.photos_pick(max, types)
+    warn_on_error(nif().photos_pick(max, types), "pick/2")
     socket
   end
 
@@ -156,7 +166,7 @@ defmodule MobPhotos do
   """
   @spec list_media(Mob.Socket.t(), keyword()) :: Mob.Socket.t()
   def list_media(socket, opts \\ []) do
-    :mob_photos_nif.media_list(:json.encode(list_media_opts(opts)))
+    warn_on_error(nif().media_list(:json.encode(list_media_opts(opts))), "list_media/2")
     socket
   end
 
@@ -533,4 +543,13 @@ defmodule MobPhotos do
   end
 
   defp unix_ms_to_iso8601(_ms), do: nil
+
+  # The NIF module. Tests put a stub in the :mob_photos app env.
+  defp nif, do: Application.get_env(:mob_photos, :nif, :mob_photos_nif)
+
+  defp warn_on_error({:error, reason}, function) do
+    Logger.warning("MobPhotos.#{function}: the native side refused the call: #{inspect(reason)}")
+  end
+
+  defp warn_on_error(_answer, _function), do: :ok
 end

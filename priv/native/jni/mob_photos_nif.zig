@@ -77,8 +77,11 @@ inline fn pidFromLong(jpid: jni.JLong) erts.ErlNifPid {
 }
 
 /// Call `MobPhotosBridge.<method>(pid_long, arg)` — async; results land later
-/// via the deliver thunks. Returns :ok unconditionally.
+/// via the deliver thunks. Returns :ok once the call is handed to the bridge,
+/// {error, bridge_not_registered} when the bridge class or method ID is not
+/// cached, :error when no JNI env can be attached.
 fn callBridgePidStr(env: ?*erts.ErlNifEnv, method: jni.JMethodID, pid: erts.ErlNifPid, arg: ?[*:0]const u8) erts.ERL_NIF_TERM {
+    if (g_photos_cls == null or method == null) return bridgeNotRegistered(env);
     var attached: c_int = 0;
     const jenv = get_jenv(&attached) orelse return erts.atom(env, "error");
     const jarg: jni.JString = if (arg) |a| jni.newStringUTF(jenv, a) else null;
@@ -86,6 +89,13 @@ fn callBridgePidStr(env: ?*erts.ErlNifEnv, method: jni.JMethodID, pid: erts.ErlN
     if (jarg != null) jni.deleteLocalRef(jenv, jarg);
     detachIfAttached(attached);
     return erts.ok(env);
+}
+
+/// {error, bridge_not_registered}: nativeRegister never ran (MobPluginBootstrap
+/// did not call MobPhotosBridge.register()) or a method-ID lookup failed. The
+/// MobPhotos wrappers log it as a warning (MOB-424).
+fn bridgeNotRegistered(env: ?*erts.ErlNifEnv) erts.ERL_NIF_TERM {
+    return erts.makeTuple(env, .{ erts.atom(env, "error"), erts.atom(env, "bridge_not_registered") });
 }
 
 // ── Inbound delivery thunks ───────────────────────────────────────────────
