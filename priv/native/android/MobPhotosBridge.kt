@@ -813,18 +813,24 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
                 if (settled.compareAndSet(false, true)) {
                     uri = u
                     scanned.countDown()
-                } else if (u != null) {
+                } else {
                     // Indexed after we gave up and deleted the file: remove
-                    // the row too, or the gallery shows a broken entry.
-                    runCatching { ctx.contentResolver.delete(u, null, null) }
+                    // the row too, or the gallery shows a broken entry. On
+                    // API 28 that delete also deletes the row's file, which is
+                    // why the path stayed reserved (freeName) until now.
+                    if (u != null) runCatching { ctx.contentResolver.delete(u, null, null) }
+                    abandonedPaths.remove(dest.absolutePath)
                 }
             }
             // Not indexed means the gallery won't show it: a failure, not a save.
             if (!scanned.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                // Reserved before settling, so the late answer's remove comes after.
+                abandonedPaths.add(dest.absolutePath)
                 if (settled.compareAndSet(false, true)) {
                     throw SaveError("the media scanner didn't index the file in time")
                 }
                 // The answer won the race by a hair: it is about to count down.
+                abandonedPaths.remove(dest.absolutePath)
                 scanned.await()
             }
             return uri ?: throw SaveError("the media scanner couldn't index the file")
@@ -843,10 +849,15 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
         val ext = if (name.contains('.')) "." + name.substringAfterLast('.') else ""
         var candidate = File(dir, name)
         var n = 1
-        while (candidate.exists()) {
+        while (candidate.exists() || abandonedPaths.contains(candidate.absolutePath)) {
             candidate = File(dir, "$stem ($n)$ext")
             n++
         }
         return candidate
     }
+
+    // API 28: paths whose scan timed out and may still be indexed. A late scan
+    // deletes its row, and with it the row's file, so no new save may use the
+    // path until that scan has answered.
+    private val abandonedPaths: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 }
