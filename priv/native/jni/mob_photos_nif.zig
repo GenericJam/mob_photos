@@ -7,7 +7,8 @@
 //! contracts). Pick results arrive back via the exported deliver thunks.
 //! photo_thumbnail(receiver, json) hands a JSON request to the bridge's
 //! worker pool; the JSON reply comes back through nativeDeliverThumbnail as
-//! {:mob_photos_thumbnail, json}.
+//! {:mob_photos_thumbnail, json}. photo_save(receiver, json) does the same
+//! for a save into MediaStore: {:mob_photos_saved, json} via nativeDeliverSaved.
 //!
 //! Delivered message shapes (exact core parity):
 //!   * cancelled -> {:photos, :cancelled}
@@ -38,6 +39,7 @@ const PhotosMethods = struct {
     photos_pick: jni.JMethodID = null,
     media_list: jni.JMethodID = null,
     photo_thumbnail: jni.JMethodID = null,
+    photo_save: jni.JMethodID = null,
 };
 
 var g_photos: PhotosMethods = .{};
@@ -57,6 +59,8 @@ export fn Java_io_mob_photos_MobPhotosBridge_nativeRegister(jenv: *jni.JNIEnv, c
     // byte[] (not jstrings): NewStringUTF wants modified UTF-8, byte arrays
     // round-trip UTF-8 JSON verbatim (paths/names can be non-BMP).
     g_photos.photo_thumbnail = jni.getStaticMethodID(jenv, cls, "photo_thumbnail", "(J[B)V");
+    jni.exceptionClear(jenv);
+    g_photos.photo_save = jni.getStaticMethodID(jenv, cls, "photo_save", "(J[B)V");
     jni.exceptionClear(jenv);
 }
 
@@ -271,16 +275,13 @@ fn literalBinary(env: ?*erts.ErlNifEnv, comptime json: []const u8) erts.ERL_NIF_
     return erts.enif_make_binary(env, &bin);
 }
 
-// photo_thumbnail(receiver_pid, request_json) -> ok | reply_json. Only QUEUES
-// the work: the bridge runs the decode on its own worker thread and answers
-// via nativeDeliverThumbnail below, so no BEAM scheduler (normal or dirty —
-// the VM runs a single dirty-IO scheduler) ever waits on BitmapFactory. A
-// JSON reply is returned directly only when the work can't be queued.
-fn nif_photo_thumbnail(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
-    _ = argc;
+// Hand a JSON request to a bridge method `(J[B)V` that queues the work on its
+// own thread and answers the receiver pid later. A JSON reply is returned
+// directly only when the work can't be queued.
+fn queueRequest(env: ?*erts.ErlNifEnv, argv: [*]const erts.ERL_NIF_TERM, method: jni.JMethodID) erts.ERL_NIF_TERM {
     var pid: erts.ErlNifPid = undefined;
     if (erts.enif_get_local_pid(env, argv[0], &pid) == 0) return erts.badarg(env);
-    if (g_photos_cls == null or g_photos.photo_thumbnail == null)
+    if (g_photos_cls == null or method == null)
         return literalBinary(env, "{\"error\":\"mob_photos bridge not registered\"}");
     var attached: c_int = 0;
     const jenv = get_jenv(&attached) orelse return literalBinary(env, "{\"error\":\"no JNI env\"}");
@@ -290,7 +291,7 @@ fn nif_photo_thumbnail(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.E
         return erts.badarg(env);
     };
     defer jni.deleteLocalRef(jenv, req);
-    jenv.*.CallStaticVoidMethod.?(jenv, g_photos_cls, g_photos.photo_thumbnail, pidToJlong(pid), req);
+    jenv.*.CallStaticVoidMethod.?(jenv, g_photos_cls, method, pidToJlong(pid), req);
     // The bridge only hands the request to its executor and catches
     // everything itself; this guards a JNI-level failure (e.g. a rejected
     // execution or OOM) so the exception doesn't leak into the next call.
@@ -298,15 +299,25 @@ fn nif_photo_thumbnail(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.E
     return erts.ok(env);
 }
 
-// {:mob_photos_thumbnail, reply_json} to the receiver pid passed to
-// photo_thumbnail/2. Called from the bridge's worker thread.
-export fn Java_io_mob_photos_MobPhotosBridge_nativeDeliverThumbnail(
-    jenv: *jni.JNIEnv,
-    cls: jni.JClass,
-    pid_long: jni.JLong,
-    reply: jni.JByteArray,
-) callconv(.c) void {
-    _ = cls;
+// photo_thumbnail(receiver_pid, request_json) -> ok | reply_json. Only QUEUES
+// the work: the bridge runs the decode on its own worker thread and answers
+// via nativeDeliverThumbnail below, so no BEAM scheduler (normal or dirty —
+// the VM runs a single dirty-IO scheduler) ever waits on BitmapFactory.
+fn nif_photo_thumbnail(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
+    _ = argc;
+    return queueRequest(env, argv, g_photos.photo_thumbnail);
+}
+
+// photo_save(receiver_pid, request_json) -> ok | reply_json. Queues the copy
+// into MediaStore on the bridge's save thread; the reply comes back through
+// nativeDeliverSaved.
+fn nif_photo_save(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
+    _ = argc;
+    return queueRequest(env, argv, g_photos.photo_save);
+}
+
+// {tag, reply_json} to a receiver pid. Called from a bridge worker thread.
+fn deliverReply(jenv: *jni.JNIEnv, pid_long: jni.JLong, reply: jni.JByteArray, comptime tag: [:0]const u8) void {
     var pid = pidFromLong(pid_long);
     const env = erts.enif_alloc_env() orelse return;
     defer erts.enif_free_env(env);
@@ -315,8 +326,31 @@ export fn Java_io_mob_photos_MobPhotosBridge_nativeDeliverThumbnail(
     var bin: erts.ErlNifBinary = undefined;
     if (erts.enif_alloc_binary(@intCast(len_j), &bin) == 0) return;
     if (len_j > 0) jni.getByteArrayRegion(jenv, reply, 0, len_j, @ptrCast(bin.data));
-    const msg = erts.makeTuple(env, .{ erts.atom(env, "mob_photos_thumbnail"), erts.enif_make_binary(env, &bin) });
+    const msg = erts.makeTuple(env, .{ erts.atom(env, tag), erts.enif_make_binary(env, &bin) });
     _ = erts.enif_send(null, &pid, env, msg);
+}
+
+// {:mob_photos_thumbnail, reply_json} to the receiver pid passed to
+// photo_thumbnail/2.
+export fn Java_io_mob_photos_MobPhotosBridge_nativeDeliverThumbnail(
+    jenv: *jni.JNIEnv,
+    cls: jni.JClass,
+    pid_long: jni.JLong,
+    reply: jni.JByteArray,
+) callconv(.c) void {
+    _ = cls;
+    deliverReply(jenv, pid_long, reply, "mob_photos_thumbnail");
+}
+
+// {:mob_photos_saved, reply_json} to the receiver pid passed to photo_save/2.
+export fn Java_io_mob_photos_MobPhotosBridge_nativeDeliverSaved(
+    jenv: *jni.JNIEnv,
+    cls: jni.JClass,
+    pid_long: jni.JLong,
+    reply: jni.JByteArray,
+) callconv(.c) void {
+    _ = cls;
+    deliverReply(jenv, pid_long, reply, "mob_photos_saved");
 }
 
 // ── NIF table + init entry point ─────────────────────────────────────────
@@ -331,6 +365,7 @@ const nif_funcs = [_]erts.ErlNifFunc{
     .{ .name = "photos_pick", .arity = 2, .fptr = nif_photos_pick, .flags = 0 },
     .{ .name = "media_list", .arity = 1, .fptr = nif_media_list, .flags = 0 },
     .{ .name = "photo_thumbnail", .arity = 2, .fptr = nif_photo_thumbnail, .flags = 0 },
+    .{ .name = "photo_save", .arity = 2, .fptr = nif_photo_save, .flags = 0 },
 };
 
 var nif_entry: erts.ErlNifEntry = .{

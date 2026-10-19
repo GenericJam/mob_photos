@@ -89,10 +89,10 @@ static NSString *pho_mime_for_uti(NSString *uti) {
 }
 
 // ── :media permission (registered with core's registry at NIF load) ───────
-static void pho_send_permission(ErlNifPid pid, const char *status) {
+static void pho_send_permission(ErlNifPid pid, const char *cap, const char *status) {
   ErlNifEnv *e = enif_alloc_env();
   ERL_NIF_TERM msg = enif_make_tuple3(e, enif_make_atom(e, "permission"),
-                                      enif_make_atom(e, "media"), enif_make_atom(e, status));
+                                      enif_make_atom(e, cap), enif_make_atom(e, status));
   enif_send(NULL, &pid, e, msg);
   enif_free_env(e);
 }
@@ -103,7 +103,7 @@ static void mob_photos_request_permission(ErlNifPid pid) {
                                  handler:^(PHAuthorizationStatus status) {
                                    BOOL ok = (status == PHAuthorizationStatusAuthorized ||
                                               status == PHAuthorizationStatusLimited);
-                                   pho_send_permission(pid, ok ? "granted" : "denied");
+                                   pho_send_permission(pid, "media", ok ? "granted" : "denied");
                                  }];
 }
 
@@ -663,14 +663,101 @@ static ERL_NIF_TERM nif_photo_thumbnail(ErlNifEnv *env, int argc, const ERL_NIF_
     return enif_make_atom(env, "ok");
 }
 
+// ── Save to the library ───────────────────────────────────────────────────
+// photo_save(Receiver, RequestJson) -> ok. RequestJson is
+// {"path","name","mime","type":"image"|"video","album"} (MobPhotos.save/3).
+// Asks for add-only access (the prompt shows once; NSPhotoLibraryAddUsage-
+// Description), then adds the file as a new asset named `name`. `album` is
+// ignored: adding to an album needs read-write access. The reply goes to
+// Receiver as {mob_photos_saved, Json}: {"uri":"ph://<localIdentifier>"} or
+// {"error":"permission_denied"|"not_found"|message}.
+static void pho_send_saved(ErlNifPid pid, NSDictionary *reply) {
+    NSData *json = [NSJSONSerialization isValidJSONObject:reply]
+                       ? [NSJSONSerialization dataWithJSONObject:reply options:0 error:nil]
+                       : nil;
+    if (!json)
+        json = [@"{\"error\":\"could not encode the save reply\"}" dataUsingEncoding:NSUTF8StringEncoding];
+    ErlNifEnv *e = enif_alloc_env();
+    ERL_NIF_TERM msg =
+        enif_make_tuple2(e, enif_make_atom(e, "mob_photos_saved"), pho_make_binary(e, json.bytes, json.length));
+    enif_send(NULL, &pid, e, msg);
+    enif_free_env(e);
+}
+
+static BOOL pho_can_add(PHAuthorizationStatus s) {
+    return s == PHAuthorizationStatusAuthorized || s == PHAuthorizationStatusLimited;
+}
+
+static ERL_NIF_TERM nif_photo_save(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    ErlNifPid pid;
+    if (!enif_get_local_pid(env, argv[0], &pid))
+        return enif_make_badarg(env);
+    ErlNifBinary bin;
+    if (!enif_inspect_binary(env, argv[1], &bin) && !enif_inspect_iolist_as_binary(env, argv[1], &bin))
+        return enif_make_badarg(env);
+    NSDictionary *req = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:bin.data length:bin.size]
+                                                        options:0
+                                                          error:nil];
+    if (![req isKindOfClass:[NSDictionary class]] || !pho_string(req[@"path"]))
+        return enif_make_badarg(env);
+    NSString *path = pho_string(req[@"path"]);
+    NSString *name = pho_string(req[@"name"]) ?: path.lastPathComponent;
+    BOOL video = [pho_string(req[@"type"]) isEqualToString:@"video"];
+
+    [PHPhotoLibrary
+        requestAuthorizationForAccessLevel:PHAccessLevelAddOnly
+                                   handler:^(PHAuthorizationStatus status) {
+                                     if (!pho_can_add(status)) {
+                                         pho_send_saved(pid, pho_error(@"permission_denied"));
+                                         return;
+                                     }
+                                     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+                                         pho_send_saved(pid, pho_error(@"not_found"));
+                                         return;
+                                     }
+                                     __block NSString *localId = nil;
+                                     [[PHPhotoLibrary sharedPhotoLibrary]
+                                         performChanges:^{
+                                           PHAssetCreationRequest *r = [PHAssetCreationRequest creationRequestForAsset];
+                                           PHAssetResourceCreationOptions *o = [PHAssetResourceCreationOptions new];
+                                           o.originalFilename = name;
+                                           [r addResourceWithType:video ? PHAssetResourceTypeVideo
+                                                                        : PHAssetResourceTypePhoto
+                                                          fileURL:[NSURL fileURLWithPath:path]
+                                                          options:o];
+                                           localId = r.placeholderForCreatedAsset.localIdentifier;
+                                         }
+                                         completionHandler:^(BOOL success, NSError *err) {
+                                           if (success && localId)
+                                               pho_send_saved(pid, @{@"uri" : [@"ph://" stringByAppendingString:localId]});
+                                           else
+                                               pho_send_saved(pid, pho_error(err.localizedDescription
+                                                                                 ?: @"the photo library refused the file"));
+                                         }];
+                                   }];
+    return enif_make_atom(env, "ok");
+}
+
+// ── :media_save permission (add-only access) ──────────────────────────────
+static void mob_photos_request_save_permission(ErlNifPid pid) {
+    [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly
+                                               handler:^(PHAuthorizationStatus status) {
+                                                 pho_send_permission(pid, "media_save",
+                                                                     pho_can_add(status) ? "granted" : "denied");
+                                               }];
+}
+
 // ── Registration ──────────────────────────────────────────────────────────
-// load callback registers the :media permission handler with core's registry
-// (the picker itself needs no permission, but enumeration does).
+// load callback registers the :media and :media_save permission handlers with
+// core's registry (the picker itself needs no permission, but enumeration
+// and saving do).
 static int pho_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     (void)env;
     (void)priv_data;
     (void)load_info;
     mob_register_permission_handler("media", mob_photos_request_permission);
+    mob_register_permission_handler("media_save", mob_photos_request_save_permission);
     return 0;
 }
 
@@ -678,6 +765,7 @@ static ErlNifFunc nif_funcs[] = {
     {"photos_pick", 2, nif_photos_pick, 0},
     {"media_list", 1, nif_media_list, 0},
     {"photo_thumbnail", 2, nif_photo_thumbnail, 0},
+    {"photo_save", 2, nif_photo_save, 0},
 };
 
 ERL_NIF_INIT(mob_photos_nif, nif_funcs, pho_load, NULL, NULL, NULL)

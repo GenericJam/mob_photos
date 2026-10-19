@@ -1,9 +1,9 @@
 defmodule MobPhotos do
   @moduledoc """
-  Photo / video library picker, library enumeration and image thumbnails — a
-  Mob plugin (extracted from mob core in Wave 2).
+  Photo / video library picker, library enumeration, image thumbnails and
+  saving into the library — a Mob plugin (extracted from mob core in Wave 2).
 
-  Three entry points, with different permission postures:
+  Four entry points, with different permission postures:
 
     * `pick/2` — the **system picker**. On iOS 14+ no permission is required
       (it runs out of process — `PHPickerViewController`); on Android the
@@ -32,6 +32,16 @@ defmodule MobPhotos do
       path, an Android `content://` URI or an iOS `ph://` asset id).
       Synchronous. Files the app owns (e.g. a picker result's `path`) need no
       permission; library URIs / asset ids need `:media`.
+
+    * `save/3` — **save a file into the library** (Android `MediaStore`,
+      optionally in an album folder; iOS `PHPhotoLibrary`). Asks only to
+      add, never to read: the `:media_save` capability (iOS add-only access,
+      `NSPhotoLibraryAddUsageDescription`; Android 9 `WRITE_EXTERNAL_STORAGE`;
+      nothing on Android 10+). Answers `{:photos, :saved, …}` or
+      `{:photos, :save_failed, …}`.
+
+  On the host (tests, `mix run`), `MobPhotos.Fake` stands in for the native
+  side: `config :mob_photos, nif: MobPhotos.Fake`.
 
   ## Picker results
 
@@ -324,6 +334,190 @@ defmodule MobPhotos do
       Process.demonitor(mref, [:flush])
       reraise e, __STACKTRACE__
   end
+
+  # ── Save ─────────────────────────────────────────────────────────────────
+
+  # Extension → {type, MIME}. The platform's own "image/*" would be refused
+  # by MediaStore, and iOS needs to know a video from a picture.
+  @save_types %{
+    ".jpg" => {"image", "image/jpeg"},
+    ".jpeg" => {"image", "image/jpeg"},
+    ".png" => {"image", "image/png"},
+    ".gif" => {"image", "image/gif"},
+    ".webp" => {"image", "image/webp"},
+    ".heic" => {"image", "image/heic"},
+    ".heif" => {"image", "image/heif"},
+    ".mp4" => {"video", "video/mp4"},
+    ".m4v" => {"video", "video/x-m4v"},
+    ".mov" => {"video", "video/quicktime"}
+  }
+
+  @typedoc "Why `save/3` failed (`{:photos, :save_failed, %{reason: reason}}`)."
+  @type save_error :: :permission_denied | :not_found | :unsupported | String.t()
+
+  @doc """
+  Save a picture or video file into the phone's photo library, where the
+  Photos / Gallery app shows it.
+
+  Asynchronous: the result is delivered to the **calling process** (call it
+  from a `Mob.Screen` callback):
+
+      handle_info({:photos, :saved, %{path: path, uri: uri}}, socket)
+      handle_info({:photos, :save_failed, %{path: path, reason: reason}}, socket)
+
+  `uri` is the new item: a `content://` URI on Android, `"ph://<localIdentifier>"`
+  on iOS. `reason` is `:permission_denied` (the user refused the photo
+  library, see below), `:not_found` (no such file), `:unsupported` (not a
+  `.jpg`/`.jpeg`/`.png`/`.gif`/`.webp`/`.heic`/`.heif` picture or a
+  `.mp4`/`.m4v`/`.mov` video), or a message from the platform.
+
+  The file is copied; the original stays where it is.
+
+  Options:
+    - `album:` a folder name, e.g. `"Bezalel"` (default: none). Android puts
+      the item in `Pictures/<album>` (videos: `Movies/<album>`), which the
+      Gallery shows as an album. iOS ignores it: adding to an album needs
+      full library access, and saving only asks to add.
+    - `name:` the item's file name (default: the file's own). Android renames
+      a clash (`"name (1).png"`); iOS keeps it as the original file name.
+
+  ## Permission
+
+  Saving never needs read access to the library.
+
+    * **iOS**: add-only access (`PHAccessLevelAddOnly`). The first save asks;
+      the host's `Info.plist` must carry `NSPhotoLibraryAddUsageDescription`
+      (this plugin merges a placeholder; replace it). If the user refused,
+      every save fails with `:permission_denied` until they allow it in
+      Settings.
+    * **Android 10+** (API 29): none. The app adds its own MediaStore items.
+    * **Android 9** (API 28): `WRITE_EXTERNAL_STORAGE`, declared by this
+      plugin. Without the grant a save fails with `:permission_denied`.
+
+  To ask up front (and to get the prompt on Android 9), request the
+  `:media_save` capability first:
+  `Mob.Permissions.request(socket, :media_save)`, answered with
+  `{:permission, :media_save, :granted | :denied}`; Android 10+ grants it at
+  once without a dialog.
+
+  Raises `ArgumentError` for an unknown option, or an `album:` / `name:`
+  that isn't a plain non-empty name (no `/`, not `.` or `..`).
+  """
+  @spec save(Mob.Socket.t(), String.t(), keyword()) :: Mob.Socket.t()
+  def save(socket, path, opts \\ []) when is_binary(path) do
+    case save_request(path, opts) do
+      {:ok, request} -> start_save(self(), path, request)
+      {:error, reason} -> send(self(), {:photos, :save_failed, %{path: path, reason: reason}})
+    end
+
+    socket
+  end
+
+  @doc false
+  # The JSON request handed to the photo_save NIF, or the reason it can't be
+  # made. Public (but undocumented) so it's testable without the NIF.
+  @spec save_request(String.t(), keyword()) :: {:ok, map()} | {:error, :not_found | :unsupported}
+  def save_request(path, opts) when is_binary(path) do
+    opts = Keyword.validate!(opts, album: nil, name: nil)
+    album = plain_name!(opts[:album], :album)
+    name = plain_name!(opts[:name], :name)
+
+    with {:ok, {type, mime}} <- save_type(path),
+         true <- File.regular?(path) || {:error, :not_found} do
+      {:ok,
+       %{
+         "path" => Path.expand(path),
+         "name" => name || Path.basename(path),
+         "type" => type,
+         "mime" => mime,
+         "album" => album || ""
+       }}
+    end
+  end
+
+  defp save_type(path) do
+    case Map.fetch(@save_types, path |> Path.extname() |> String.downcase()) do
+      {:ok, type} -> {:ok, type}
+      :error -> {:error, :unsupported}
+    end
+  end
+
+  defp plain_name!(nil, _opt), do: nil
+
+  defp plain_name!(value, opt) do
+    if is_binary(value) and String.valid?(value) and String.trim(value) != "" and
+         value not in [".", ".."] and not String.contains?(value, ["/", "\\", <<0>>]) do
+      value
+    else
+      raise ArgumentError,
+            "#{opt} must be a non-empty name without \"/\", got: #{inspect(value)}"
+    end
+  end
+
+  # The native side answers a receiver, not the caller: the receiver turns
+  # the raw JSON reply into the public message, and goes away with the caller
+  # if the caller dies first (the user may sit on the iOS prompt).
+  defp start_save(caller, path, request) do
+    receiver =
+      spawn(fn ->
+        mref = Process.monitor(caller)
+
+        receive do
+          {:mob_photos_saved, json} -> send(caller, decode_save_result(path, json))
+          {:DOWN, ^mref, :process, _pid, _reason} -> :ok
+        end
+      end)
+
+    json = request |> :json.encode() |> IO.iodata_to_binary()
+
+    case call_save_nif(receiver, json) do
+      :ok ->
+        :ok
+
+      reply when is_binary(reply) ->
+        send(receiver, {:mob_photos_saved, reply})
+
+      other ->
+        Process.exit(receiver, :kill)
+
+        send(
+          caller,
+          {:photos, :save_failed,
+           %{
+             path: path,
+             reason: "photo_save/2 returned #{inspect(other)}, expected :ok or a JSON reply"
+           }}
+        )
+    end
+  end
+
+  defp call_save_nif(receiver, json) do
+    nif().photo_save(receiver, json)
+  rescue
+    e ->
+      Process.exit(receiver, :kill)
+      reraise e, __STACKTRACE__
+  end
+
+  @doc false
+  # The native JSON reply → the message the caller receives. Public (but
+  # undocumented) so the decoding is testable without the NIF.
+  @spec decode_save_result(String.t(), binary()) ::
+          {:photos, :saved, %{path: String.t(), uri: String.t()}}
+          | {:photos, :save_failed, %{path: String.t(), reason: save_error()}}
+  def decode_save_result(path, json) when is_binary(json) do
+    case :json.decode(json) do
+      %{"uri" => uri} when is_binary(uri) ->
+        {:photos, :saved, %{path: path, uri: uri}}
+
+      %{"error" => reason} when is_binary(reason) ->
+        {:photos, :save_failed, %{path: path, reason: decode_save_error(reason)}}
+    end
+  end
+
+  defp decode_save_error("permission_denied"), do: :permission_denied
+  defp decode_save_error("not_found"), do: :not_found
+  defp decode_save_error(message), do: message
 
   @max_max_size 16_384
   # The largest `after` timeout the VM accepts.
