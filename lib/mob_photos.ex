@@ -259,7 +259,7 @@ defmodule MobPhotos do
           {:ok, thumbnail_info()}
           | {:error, :not_found | :unsupported | :permission | :timeout | String.t()}
   def thumbnail(source, opts \\ []) when is_binary(source) do
-    with {:ok, json} <- thumbnail_reply(:mob_photos_nif, source, opts) do
+    with {:ok, json} <- thumbnail_reply(nif(), source, opts) do
       decode_thumbnail_result(json)
     end
   end

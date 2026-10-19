@@ -800,15 +800,23 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
         }
         if (!dir.isDirectory && !dir.mkdirs()) throw SaveError("could not create ${dir.path}")
         val dest = freeName(dir, name)
-        file.inputStream().use { input -> dest.outputStream().use { input.copyTo(it) } }
-        val scanned = java.util.concurrent.CountDownLatch(1)
-        var uri: Uri? = null
-        MediaScannerConnection.scanFile(ctx, arrayOf(dest.absolutePath), arrayOf(mime)) { _, u ->
-            uri = u
-            scanned.countDown()
+        try {
+            file.inputStream().use { input -> dest.outputStream().use { input.copyTo(it) } }
+            val scanned = java.util.concurrent.CountDownLatch(1)
+            var uri: Uri? = null
+            MediaScannerConnection.scanFile(ctx, arrayOf(dest.absolutePath), arrayOf(mime)) { _, u ->
+                uri = u
+                scanned.countDown()
+            }
+            // Not indexed means the gallery won't show it: a failure, not a save.
+            if (!scanned.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                throw SaveError("the media scanner didn't index the file in time")
+            }
+            return uri ?: throw SaveError("the media scanner couldn't index the file")
+        } catch (e: Throwable) {
+            dest.delete()
+            throw e
         }
-        scanned.await(10, java.util.concurrent.TimeUnit.SECONDS)
-        return uri ?: Uri.fromFile(dest)
     }
 
     // "name.png", then "name (1).png", "name (2).png", … (MediaStore's style).
