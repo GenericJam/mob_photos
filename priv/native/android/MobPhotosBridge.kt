@@ -31,6 +31,7 @@
 package io.mob.photos
 
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -39,7 +40,9 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.media.ExifInterface
+import android.media.MediaScannerConnection
 import android.net.Uri
+import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.activity.result.ActivityResultLauncher
@@ -65,6 +68,9 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
     // Thumbnail decodes run here, never on a BEAM scheduler thread. Two
     // workers bound the memory of concurrent full-size decodes.
     private val thumbnailPool = java.util.concurrent.Executors.newFixedThreadPool(2)
+
+    // Saves to the library run here, one at a time, in the order asked.
+    private val savePool = java.util.concurrent.Executors.newSingleThreadExecutor()
 
     @JvmStatic external fun nativeRegister()
 
@@ -92,6 +98,14 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
         reply: ByteArray,
     )
 
+    // {:mob_photos_saved, reply_json} to the receiver pid given to the
+    // photo_save NIF; MobPhotos.save/3's receiver turns it into
+    // {:photos, :saved | :save_failed, …} for the caller.
+    @JvmStatic external fun nativeDeliverSaved(
+        pid: Long,
+        reply: ByteArray,
+    )
+
     @JvmStatic fun register() = nativeRegister()
 
     override fun setActivity(activity: Activity) {
@@ -106,7 +120,18 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
     // MobBridge.request_permission falls through to
     // MobPluginBootstrap.permissionsFor(cap) for caps it doesn't know, which
     // walks the registered providers — this is how :media is granted.
+    //
+    // :media_save (saving into the library, save/3) needs nothing on API 29+
+    // (an app may always add its own MediaStore items), so it is granted with
+    // no dialog; API 28 has no scoped storage and needs WRITE_EXTERNAL_STORAGE.
     override fun permissionsFor(cap: String): Array<String>? {
+        if (cap == "media_save") {
+            return if (android.os.Build.VERSION.SDK_INT >= 29) {
+                emptyArray()
+            } else {
+                arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            }
+        }
         if (cap != "media") return null
         val sdk = android.os.Build.VERSION.SDK_INT
         val read =
@@ -662,4 +687,177 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
             .digest(s.toByteArray(Charsets.UTF_8))
             .take(8)
             .joinToString("") { "%02x".format(it) }
+
+    // ── Save to the library ───────────────────────────────────────────────
+    // photo_save(pid, request): request is UTF-8 JSON {"path", "name", "mime",
+    // "type": "image"|"video", "album"} built by MobPhotos.save_request/2.
+    // Returns at once: the copy runs on savePool (one thread, never a BEAM
+    // scheduler) and the JSON reply {"uri": …} or {"error": …} goes back
+    // through nativeDeliverSaved to the receiver MobPhotos.save/3 spawned.
+    // Never throws.
+    @JvmStatic
+    fun photo_save(
+        pid: Long,
+        request: ByteArray,
+    ) {
+        try {
+            savePool.execute { nativeDeliverSaved(pid, saveReply(request)) }
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            nativeDeliverSaved(pid, errorReply("save worker unavailable"))
+        }
+    }
+
+    private fun saveReply(request: ByteArray): ByteArray {
+        val reply =
+            try {
+                JSONObject().put("uri", save(JSONObject(String(request, Charsets.UTF_8))).toString())
+            } catch (e: SaveError) {
+                JSONObject().put("error", e.code)
+            } catch (e: FileNotFoundException) {
+                JSONObject().put("error", if (isPermissionDenied(e)) "permission_denied" else "not_found")
+            } catch (e: SecurityException) {
+                JSONObject().put("error", "permission_denied")
+            } catch (e: Throwable) {
+                JSONObject().put("error", e.message ?: e.javaClass.simpleName)
+            }
+        return reply.toString().toByteArray(Charsets.UTF_8)
+    }
+
+    private class SaveError(
+        val code: String,
+    ) : Exception(code)
+
+    private fun save(req: JSONObject): Uri {
+        val ctx = appContext ?: throw SaveError("mob_photos bridge has no context yet")
+        val file = File(req.getString("path"))
+        if (!file.isFile) throw SaveError("not_found")
+        val name = req.optString("name").ifEmpty { file.name }
+        val mime = req.getString("mime")
+        val video = req.optString("type") == "video"
+        val album = req.optString("album")
+        val base = if (video) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES
+        return if (android.os.Build.VERSION.SDK_INT >= 29) {
+            saveScoped(ctx, file, name, mime, video, if (album.isEmpty()) base else "$base/$album")
+        } else {
+            saveLegacy(ctx, file, name, mime, File(Environment.getExternalStoragePublicDirectory(base), album))
+        }
+    }
+
+    // API 29+: a MediaStore row under RELATIVE_PATH, pending while the bytes
+    // are copied so the gallery never shows a half-written file. Files the
+    // app inserts itself need no permission. A clashing DISPLAY_NAME is
+    // renamed by MediaStore ("name (1).png").
+    @android.annotation.TargetApi(29)
+    private fun saveScoped(
+        ctx: Context,
+        file: File,
+        name: String,
+        mime: String,
+        video: Boolean,
+        relativePath: String,
+    ): Uri {
+        val resolver = ctx.contentResolver
+        val collection =
+            if (video) {
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            } else {
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            }
+        val values =
+            ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+        val uri = resolver.insert(collection, values) ?: throw SaveError("the media library refused the new item")
+        try {
+            val out = resolver.openOutputStream(uri) ?: throw SaveError("could not open the new item for writing")
+            out.use { o -> file.inputStream().use { it.copyTo(o) } }
+            // An item still pending never shows in the gallery: a failure, not a save.
+            val published = resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            if (published != 1) throw SaveError("the media library didn't publish the new item")
+        } catch (e: Throwable) {
+            runCatching { resolver.delete(uri, null, null) }
+            throw e
+        }
+        return uri
+    }
+
+    // API 28: a file in the shared Pictures/Movies directory, then indexed by
+    // the media scanner. Needs WRITE_EXTERNAL_STORAGE (the :media_save
+    // capability on this API level).
+    @Suppress("DEPRECATION")
+    private fun saveLegacy(
+        ctx: Context,
+        file: File,
+        name: String,
+        mime: String,
+        dir: File,
+    ): Uri {
+        if (ctx.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            throw SaveError("permission_denied")
+        }
+        if (!dir.isDirectory && !dir.mkdirs()) throw SaveError("could not create ${dir.path}")
+        val dest = freeName(dir, name)
+        try {
+            file.inputStream().use { input -> dest.outputStream().use { input.copyTo(it) } }
+            val scanned = java.util.concurrent.CountDownLatch(1)
+            // Whichever comes first, the scan's answer or our timeout, settles
+            // the save; the other then knows it lost.
+            val settled = java.util.concurrent.atomic.AtomicBoolean(false)
+            var uri: Uri? = null
+            MediaScannerConnection.scanFile(ctx, arrayOf(dest.absolutePath), arrayOf(mime)) { _, u ->
+                if (settled.compareAndSet(false, true)) {
+                    uri = u
+                    scanned.countDown()
+                } else {
+                    // Indexed after we gave up and deleted the file: remove
+                    // the row too, or the gallery shows a broken entry. On
+                    // API 28 that delete also deletes the row's file, which is
+                    // why the path stayed reserved (freeName) until now.
+                    if (u != null) runCatching { ctx.contentResolver.delete(u, null, null) }
+                    abandonedPaths.remove(dest.absolutePath)
+                }
+            }
+            // Not indexed means the gallery won't show it: a failure, not a save.
+            if (!scanned.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                // Reserved before settling, so the late answer's remove comes after.
+                abandonedPaths.add(dest.absolutePath)
+                if (settled.compareAndSet(false, true)) {
+                    throw SaveError("the media scanner didn't index the file in time")
+                }
+                // The answer won the race by a hair: it is about to count down.
+                abandonedPaths.remove(dest.absolutePath)
+                scanned.await()
+            }
+            return uri ?: throw SaveError("the media scanner couldn't index the file")
+        } catch (e: Throwable) {
+            dest.delete()
+            throw e
+        }
+    }
+
+    // "name.png", then "name (1).png", "name (2).png", … (MediaStore's style).
+    private fun freeName(
+        dir: File,
+        name: String,
+    ): File {
+        val stem = name.substringBeforeLast('.')
+        val ext = if (name.contains('.')) "." + name.substringAfterLast('.') else ""
+        var candidate = File(dir, name)
+        var n = 1
+        while (candidate.exists() || abandonedPaths.contains(candidate.absolutePath)) {
+            candidate = File(dir, "$stem ($n)$ext")
+            n++
+        }
+        return candidate
+    }
+
+    // API 28: paths whose scan timed out and may still be indexed. A late scan
+    // deletes its row, and with it the row's file, so no new save may use the
+    // path until that scan has answered.
+    private val abandonedPaths: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 }

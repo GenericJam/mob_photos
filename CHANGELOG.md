@@ -6,6 +6,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
+## [Unreleased]
+
+### Added
+- **`MobPhotos.save/3`: save a picture or video file into the phone's photo
+  library.** Asynchronous: `{:photos, :saved, %{path, uri}}` or
+  `{:photos, :save_failed, %{path, reason}}` (`:permission_denied`,
+  `:not_found`, `:unsupported` or the platform's message). Android inserts a
+  MediaStore item (under `Pictures/<album>` / `Movies/<album>` with
+  `album:`), pending while the bytes are copied, on a bridge thread; API 28
+  writes the shared directory and runs the media scanner. iOS adds a
+  `PHAsset` with add-only access, named `name:`; albums are ignored there
+  (they need read-write access).
+- **`:media_save` capability**: iOS add-only access
+  (`NSPhotoLibraryAddUsageDescription`, a placeholder merged into
+  `Info.plist`); Android grants it with no dialog on API 29+ and maps it to
+  `WRITE_EXTERNAL_STORAGE` on API 28 (now declared in the manifest).
+- **`MobPhotos.Fake`**, a host stand-in for the NIF
+  (`config :mob_photos, nif: MobPhotos.Fake`): saves copy into
+  `MobPhotos.Fake.library_dir/0`, `set_save_answer/1` scripts a refusal,
+  pick answers cancelled, listing answers `[]`, `thumbnail/2` answers
+  `{:error, :unsupported}`.
+
 ## [0.2.2] - 2026-10-13
 
 ### Fixed

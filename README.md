@@ -11,6 +11,9 @@ Photo / video library access for apps built with [Mob](https://hexdocs.pm/mob)
   `:media` permission.
 - `MobPhotos.thumbnail/2` — a downscaled, upright JPEG of one image plus its
   metadata: dimensions, capture time, GPS, camera make/model. Synchronous.
+- `MobPhotos.save/3` — save a picture or video file into the library
+  (Android `MediaStore`, in an album folder; iOS `PHPhotoLibrary`, add-only
+  access).
 
 ## Installation
 
@@ -83,6 +86,41 @@ decoded on a native worker thread (never a BEAM scheduler). Errors:
 `{:error, :not_found | :unsupported | :permission | :timeout}` or
 `{:error, message}`.
 
+### Save to the library
+
+```elixir
+# Optional: ask up front (needed for the prompt on Android 9).
+socket = Mob.Permissions.request(socket, :media_save)
+
+socket = MobPhotos.save(socket, "/path/to/drawing.png", album: "MyApp", name: "Lampstand.png")
+
+def handle_info({:photos, :saved, %{path: path, uri: uri}}, socket), do: ...
+# uri: "content://media/external/images/media/57" (Android) | "ph://<localIdentifier>" (iOS)
+
+def handle_info({:photos, :save_failed, %{path: path, reason: reason}}, socket), do: ...
+# reason: :permission_denied | :not_found | :unsupported | "platform message"
+```
+
+The file is copied. Android puts it in `Pictures/<album>` (`Movies/<album>`
+for a video) with no permission on Android 10+ (`WRITE_EXTERNAL_STORAGE` on
+Android 9). iOS asks for add-only access the first time
+(`NSPhotoLibraryAddUsageDescription`: replace the placeholder this plugin
+merges into `Info.plist`).
+
+### On the host
+
+`MobPhotos.Fake` stands in for the native side in tests and `mix run`:
+
+```elixir
+# config/test.exs
+config :mob_photos, nif: MobPhotos.Fake
+```
+
+Saves are copied into `MobPhotos.Fake.library_dir/0` (`saved/0` lists them;
+`set_save_answer(:permission_denied)` makes them fail), pick answers
+`{:photos, :cancelled}`, listing `{:media, :listed, []}` and `thumbnail/2`
+`{:error, :unsupported}`.
+
 ## Limits
 
 - Picker items: `type` is an atom on iOS and a string on Android (inherited
@@ -95,6 +133,9 @@ decoded on a native worker thread (never a BEAM scheduler). Errors:
   `list_media/2` (the `:media` grant includes `ACCESS_MEDIA_LOCATION`) to get
   it.
 - `thumbnail/2` handles images only; videos return `{:error, :unsupported}`.
+- `save/3` takes `.jpg`/`.jpeg`/`.png`/`.gif`/`.webp`/`.heic`/`.heif` and
+  `.mp4`/`.m4v`/`.mov`; anything else fails with `:unsupported`. iOS ignores
+  `album:` (adding to an album needs read-write access).
 
 ## Self-test
 

@@ -31,11 +31,12 @@ defmodule MobPhotosTest do
       assert android.lang == :zig
     end
 
-    test "owns the :media runtime-permission capability (enumeration needs it)",
+    test "owns the :media (enumeration) and :media_save (save/3) capabilities",
          %{manifest: m} do
-      assert [%{capability: :media} = entry] = m.permissions
+      assert [%{capability: :media} = read, %{capability: :media_save} = save] = m.permissions
       # iOS self-registers a handler at NIF load (mirrors mob_camera's :camera).
-      assert entry.ios.handler == "mob_photos_request_permission"
+      assert read.ios.handler == "mob_photos_request_permission"
+      assert save.ios.handler == "mob_photos_request_save_permission"
     end
 
     test "carries the media-read manifest permissions moved out of the mob_new template",
@@ -92,7 +93,7 @@ defmodule MobPhotosTest do
     test "every NIF the public API calls is exported by the stub at the right arity" do
       exports = :mob_photos_nif.module_info(:exports)
 
-      for fa <- [photos_pick: 2, media_list: 1, photo_thumbnail: 2] do
+      for fa <- [photos_pick: 2, media_list: 1, photo_thumbnail: 2, photo_save: 2] do
         assert fa in exports, "#{inspect(fa)} missing from mob_photos_nif exports"
       end
     end
@@ -406,15 +407,23 @@ defmodule MobPhotosTest do
       %{src: File.read!(ios)}
     end
 
-    test "registers the :media permission handler with core's registry at load", %{src: src} do
+    test "registers each manifest permission handler with core's registry at load", %{src: src} do
       assert src =~ "mob_register_permission_handler"
-      assert src =~ "mob_photos_request_permission"
       assert src =~ "PHPhotoLibrary"
-      # The manifest's declared iOS handler name must match the symbol the
-      # source registers.
+      # Every iOS handler the manifest declares must be a symbol the source
+      # registers, under the capability's own name.
       {:ok, m} = Manifest.load(@plugin_dir)
-      [%{ios: %{handler: handler}}] = m.permissions
-      assert src =~ handler
+      assert Enum.map(m.permissions, & &1.capability) == [:media, :media_save]
+
+      for %{capability: cap, ios: %{handler: handler}} <- m.permissions do
+        assert src =~ ~s{mob_register_permission_handler("#{cap}", #{handler});}
+      end
+    end
+
+    test "saving asks only to add (never to read the library)", %{src: src} do
+      assert src =~ "requestAuthorizationForAccessLevel:PHAccessLevelAddOnly"
+      {:ok, m} = Manifest.load(@plugin_dir)
+      assert Map.has_key?(m.ios.plist_keys, "NSPhotoLibraryAddUsageDescription")
     end
   end
 

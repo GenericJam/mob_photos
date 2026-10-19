@@ -36,8 +36,12 @@
   # owns it (parity with how mob_camera owns :camera rather than leaning on a
   # core capability). Both end up requesting the same READ_MEDIA_* set on
   # Android; declaring it here is harmless (set-unioned in the manifest merge).
+  # :media_save (save/3): add-only access. iOS handler asks for
+  # PHAccessLevelAddOnly; Android maps it to nothing on API 29+ and
+  # WRITE_EXTERNAL_STORAGE on API 28 (MobPhotosBridge.permissionsFor).
   permissions: [
-    %{capability: :media, ios: %{handler: "mob_photos_request_permission"}}
+    %{capability: :media, ios: %{handler: "mob_photos_request_permission"}},
+    %{capability: :media_save, ios: %{handler: "mob_photos_request_save_permission"}}
   ],
   android: %{
     bridge_kt: "priv/native/android/MobPhotosBridge.kt",
@@ -54,11 +58,16 @@
     # from every stream the app opens, so thumbnail/2 could never report a
     # location. MobPhotosBridge.permissionsFor("media") requests it alongside
     # READ_MEDIA_*; it has no dialog of its own.
+    # WRITE_EXTERNAL_STORAGE: save/3 on API 28 only (scoped storage lets 29+
+    # add MediaStore items without it). Upstream would scope it with
+    # android:maxSdkVersion="28"; lost in the merge like READ_EXTERNAL_STORAGE's,
+    # and a no-op on 30+.
     permissions: [
       "android.permission.READ_MEDIA_IMAGES",
       "android.permission.READ_MEDIA_VIDEO",
       "android.permission.READ_EXTERNAL_STORAGE",
-      "android.permission.ACCESS_MEDIA_LOCATION"
+      "android.permission.ACCESS_MEDIA_LOCATION",
+      "android.permission.WRITE_EXTERNAL_STORAGE"
     ]
   },
   # PHPickerViewController / PHPickerConfiguration / PHPickerResult all live
@@ -70,11 +79,14 @@
   # (the :media permission flow) — without it the dialog is suppressed. The
   # string is a placeholder the host must replace (App Store review rejects
   # the default text — intentional friction, same gate as mob_camera).
+  # NSPhotoLibraryAddUsageDescription: save/3's add-only prompt; same rule.
   ios: %{
     frameworks: ["PhotosUI", "Photos", "ImageIO", "UniformTypeIdentifiers"],
     plist_keys: %{
       "NSPhotoLibraryUsageDescription" =>
-        "Required by mob_photos to list your photo library — replace this string in your Info.plist"
+        "Required by mob_photos to list your photo library — replace this string in your Info.plist",
+      "NSPhotoLibraryAddUsageDescription" =>
+        "Required by mob_photos to save to your photo library — replace this string in your Info.plist"
     }
   }
   # No host_requirements: the picker reads content:// URIs via contentResolver
