@@ -118,7 +118,8 @@ config :mob_photos, nif: MobPhotos.Fake
 
 Saves are copied into `MobPhotos.Fake.library_dir/0` (`saved/0` lists them;
 `set_save_answer(:permission_denied)` makes them fail), pick answers
-`{:photos, :cancelled}` and listing `{:media, :listed, []}`.
+`{:photos, :cancelled}`, listing `{:media, :listed, []}` and `thumbnail/2`
+`{:error, :unsupported}`.
 
 ## Limits
 

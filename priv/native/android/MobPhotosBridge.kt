@@ -774,7 +774,9 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
         try {
             val out = resolver.openOutputStream(uri) ?: throw SaveError("could not open the new item for writing")
             out.use { o -> file.inputStream().use { it.copyTo(o) } }
-            resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            // An item still pending never shows in the gallery: a failure, not a save.
+            val published = resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            if (published != 1) throw SaveError("the media library didn't publish the new item")
         } catch (e: Throwable) {
             runCatching { resolver.delete(uri, null, null) }
             throw e
@@ -803,14 +805,27 @@ object MobPhotosBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermis
         try {
             file.inputStream().use { input -> dest.outputStream().use { input.copyTo(it) } }
             val scanned = java.util.concurrent.CountDownLatch(1)
+            // Whichever comes first, the scan's answer or our timeout, settles
+            // the save; the other then knows it lost.
+            val settled = java.util.concurrent.atomic.AtomicBoolean(false)
             var uri: Uri? = null
             MediaScannerConnection.scanFile(ctx, arrayOf(dest.absolutePath), arrayOf(mime)) { _, u ->
-                uri = u
-                scanned.countDown()
+                if (settled.compareAndSet(false, true)) {
+                    uri = u
+                    scanned.countDown()
+                } else if (u != null) {
+                    // Indexed after we gave up and deleted the file: remove
+                    // the row too, or the gallery shows a broken entry.
+                    runCatching { ctx.contentResolver.delete(u, null, null) }
+                }
             }
             // Not indexed means the gallery won't show it: a failure, not a save.
             if (!scanned.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
-                throw SaveError("the media scanner didn't index the file in time")
+                if (settled.compareAndSet(false, true)) {
+                    throw SaveError("the media scanner didn't index the file in time")
+                }
+                // The answer won the race by a hair: it is about to count down.
+                scanned.await()
             }
             return uri ?: throw SaveError("the media scanner couldn't index the file")
         } catch (e: Throwable) {

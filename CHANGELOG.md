@@ -25,7 +25,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 - **`MobPhotos.Fake`**, a host stand-in for the NIF
   (`config :mob_photos, nif: MobPhotos.Fake`): saves copy into
   `MobPhotos.Fake.library_dir/0`, `set_save_answer/1` scripts a refusal,
-  pick answers cancelled, listing answers `[]`.
+  pick answers cancelled, listing answers `[]`, `thumbnail/2` answers
+  `{:error, :unsupported}`.
 
 ## [0.2.2] - 2026-10-13
 
