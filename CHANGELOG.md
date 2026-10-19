@@ -6,7 +6,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
-## [Unreleased]
+## [0.3.0] - 2026-10-19
 
 ### Added
 - **`MobPhotos.save/3`: save a picture or video file into the phone's photo

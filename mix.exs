@@ -6,7 +6,7 @@ defmodule MobPhotos.MixProject do
   def project do
     [
       app: :mob_photos,
-      version: "0.2.2",
+      version: "0.3.0",
       elixir: "~> 1.17",
       deps: deps(),
       aliases: aliases(),
